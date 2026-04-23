@@ -4,6 +4,7 @@ use libc::{
     bind,
     close,
     c_void,
+    fcntl,
     freeaddrinfo,
     gai_strerror,
     getaddrinfo,
@@ -105,6 +106,8 @@ impl TcpListener {
             return Err(err);
         }
 
+        set_nonblocking(sockfd)?;
+
         Ok(TcpListener {
             fd: sockfd,
         })
@@ -126,6 +129,8 @@ impl TcpListener {
             return Err(io::Error::last_os_error());
         }
 
+        set_nonblocking(new_fd)?;
+
         // TODO: This should be logged
         let ai = match their_addr.ss_family as i32 {
             libc::AF_INET => {
@@ -144,6 +149,11 @@ impl TcpListener {
         println!("server: got connection from {}", ai);
 
         return Ok(TcpStream { fd: new_fd });
+    }
+
+    // Why use "raw" here? We're just returning an i32 ...
+    pub fn as_raw_fd(&self) -> i32 {
+        self.fd
     }
 }
 
@@ -176,7 +186,7 @@ impl TcpStream {
         };
 
         if bytes_received < 0 {
-            return Err(io::Error::other("recv"));
+            return Err(io::Error::last_os_error());
         } else if bytes_received == 0 {
             println!("server: client disconnected gracefully");
             return Ok(vec![]);
@@ -201,6 +211,10 @@ impl TcpStream {
             Ok(())
         }
     }
+
+    pub fn as_raw_fd(&self) -> i32 {
+        self.fd
+    }
 }
 
 impl Drop for TcpStream {
@@ -222,4 +236,20 @@ fn ipv4_to_string(addr: *const libc::in_addr) -> String {
 fn ipv6_to_string(addr: *const libc::in6_addr) -> String {
     let segments = unsafe { (*addr).s6_addr };
     std::net::Ipv6Addr::from(segments).to_string()
+}
+
+fn set_nonblocking(fd: i32) -> io::Result<()> {
+    let flags = unsafe { fcntl(fd, libc::F_GETFL, 0) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let result = unsafe { 
+        fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK)
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
 }
