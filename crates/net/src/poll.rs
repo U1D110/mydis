@@ -8,26 +8,41 @@ use libc::{
 
 use std::io;
 
-// TODO: remove `pub` for all and add getters
 pub struct Event {
-    pub readable: bool,
-    pub writable: bool,
-    pub error: bool,
-    pub hang_up: bool,
-    pub fd: i32,
+    flags: u32,
+    fd: i32,
 }
 
 impl Event {
     pub fn from_epoll(evt: epoll_event) -> Self {
-        let flags = evt.events;
-
         Event {
-            readable: (flags & libc::EPOLLIN as u32) != 0,
-            writable: (flags & libc::EPOLLOUT as u32) != 0,
-            error:    (flags & libc::EPOLLERR as u32) != 0,
-            hang_up:  (flags & libc::EPOLLHUP as u32) != 0,
-            fd:       evt.u64 as i32,
+            flags:  evt.events,
+            fd:     evt.u64 as i32,
         }
+    }
+
+    pub fn readable(&self) -> bool {
+        self.flags & libc::EPOLLIN as u32 != 0
+    }
+
+    pub fn writable(&self) -> bool {
+        self.flags & libc::EPOLLOUT as u32 != 0
+    }
+
+    pub fn error(&self) -> bool {
+        self.flags & libc::EPOLLERR as u32 != 0
+    }
+
+    pub fn hang_up(&self) -> bool {
+        self.flags & libc::EPOLLHUP as u32 != 0
+    }
+
+    pub fn rdhup(&self) -> bool {
+        self.flags & libc::EPOLLRDHUP as u32 != 0
+    }
+
+    pub fn fd(&self) -> i32 {
+        self.fd
     }
 }
 
@@ -47,6 +62,21 @@ impl Events {
     }
 }
 
+pub struct Interests {
+    read: bool,
+    write: bool,
+}
+
+impl Interests {
+    pub fn read_only() -> Self {
+        Self { read: true, write: false }
+    }
+
+    pub fn read_write() -> Self {
+        Self { read: true, write: true }
+    }
+}
+
 pub struct Poll {
     epoll_fd: i32,
 }
@@ -60,14 +90,30 @@ impl Poll {
         Ok(Poll { epoll_fd })
     }
 
-    pub fn register(&self, fd: i32) -> io::Result<()> {
+    pub fn register(&self, fd: i32, interests: Interests) -> io::Result<()> {
+        self.poll_ctl(libc::EPOLL_CTL_ADD, fd, interests)
+    }
+
+    pub fn reregister(&self, fd: i32, interests: Interests) -> io::Result<()> {
+        self.poll_ctl(libc::EPOLL_CTL_MOD, fd, interests)
+    }
+
+    fn poll_ctl(&self, op: i32, fd: i32, interests: Interests) -> io::Result<()> {
+        let mut flags = (libc::EPOLLET | libc::EPOLLRDHUP) as u32;
+        if interests.read { 
+            flags |= libc::EPOLLIN as u32; 
+        }
+        if interests.write { 
+            flags |= libc::EPOLLOUT as u32; 
+        }
+
         let mut event = epoll_event {
-            events: (libc::EPOLLIN | libc::EPOLLET) as u32,
+            events: flags,
             u64: fd as u64,
         };
 
         let res = unsafe {
-            epoll_ctl(self.epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut event)
+            epoll_ctl(self.epoll_fd, op, fd, &mut event)
         };
 
         if res < 0 {
