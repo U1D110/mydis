@@ -11,6 +11,7 @@ use std::{
     io,
 };
 
+use db::Database;
 use net::{
     Events, Interests, Poll, TcpListener
 };
@@ -19,6 +20,8 @@ const EVENT_BUF_SIZE: usize = 1024;
 const PORT: &str = "3490";
 
 fn main() -> io::Result<()> {
+    let mut database = Database::new();
+
     let listener = TcpListener::bind(PORT)?;
     let poll = Poll::new()?;
 
@@ -31,6 +34,6 @@ fn main() -> io::Result<()> {
 
     loop {
         let _ = poll.wait(&mut events)?;
-        handle_events(&events, &mut connections, &listener, &poll)?;
+        handle_events(&events, &mut connections, &listener, &poll, &mut database)?;
     }
 }

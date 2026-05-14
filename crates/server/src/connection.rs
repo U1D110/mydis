@@ -1,6 +1,7 @@
 use net::TcpStream;
 use std::io;
 
+const READ_BUF_SIZE: usize = 4096;
 const WRITE_BUF_SIZE: usize = 4096;
 
 #[derive(PartialEq)]
@@ -11,7 +12,7 @@ pub enum ConnectionStatus {
 
 pub struct Connection {
     stream: TcpStream,
-    // TODO: Probably want a separate read_buf
+    read_buf: Vec<u8>, // Maybe we use BytesMut from `bytes` crate later on
     write_buf: Vec<u8>,
 }
 
@@ -19,6 +20,7 @@ impl Connection {
     pub fn new(stream: TcpStream) -> Self {
         Connection { 
             stream,
+            read_buf: Vec::with_capacity(READ_BUF_SIZE),
             write_buf: Vec::with_capacity(WRITE_BUF_SIZE),
         }
     }
@@ -31,21 +33,32 @@ impl Connection {
         !self.write_buf.is_empty()
     }
 
-    pub fn read(&mut self, buf: &mut [u8]) -> io::Result<ConnectionStatus> {
-        match self.stream.read(buf) {
+    pub fn read_buf(&self) -> &[u8] {
+        &self.read_buf
+    }
+
+    pub fn drain_read_bytes(&mut self, num_bytes: usize) {
+        self.read_buf.drain(..num_bytes);
+    }
+
+    pub fn read(&mut self) -> io::Result<ConnectionStatus> {
+        let mut buf = [0u8; READ_BUF_SIZE];
+        match self.stream.read(&mut buf) {
             Ok(bytes_read) => {
                 if bytes_read == 0 {
                     // client disconnected
                     Ok(ConnectionStatus::Closed)
                 } else {
-                    // This is really only a write buffer because we are just echoing
-                    self.write_buf.extend_from_slice("Received: ".as_bytes());
-                    self.write_buf.extend_from_slice(&buf[..bytes_read]);
+                    self.read_buf.extend_from_slice(&buf[..bytes_read]);
                     Ok(ConnectionStatus::Active)
                 }
             },
             Err(err) => Err(err),
         }
+    }
+
+    pub fn queue_bytes(&mut self, bytes: &[u8]) {
+        self.write_buf.extend_from_slice(bytes);
     }
 
     fn write(&self) -> io::Result<usize> {

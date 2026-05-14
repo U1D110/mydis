@@ -1,14 +1,9 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+mod command;
+mod parser;
+mod response;
+mod serializer;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use command::Command;
+pub use parser::{parse, ParseResult};
+pub use response::Response;
+pub use serializer::serialize;

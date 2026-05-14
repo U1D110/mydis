@@ -6,20 +6,22 @@ use std::{
     io,
 };
 
+use db::Database;
 use net::{Events, Interests, Poll, TcpListener};
+use protocol::{ParseResult, Response};
 
 use crate::connection::{
     Connection,
     ConnectionStatus,
 };
 
-const READ_BUF_SIZE: usize = 4096;
 
 pub fn handle_events(
     events: &Events,
     connections: &mut HashMap<i32, Connection>,
     listener: &TcpListener,
     poll: &Poll,
+    database: &mut Database,
 ) -> io::Result<()> {
     for event in events.iter() {
         if event.fd() == listener.as_raw_fd() {
@@ -51,10 +53,8 @@ pub fn handle_events(
                 let connection = entry.get_mut();
             
                 if event.readable() {
-                    let mut read_buf = [0u8; READ_BUF_SIZE];
-
                     loop {
-                        match connection.read(&mut read_buf) {
+                        match connection.read() {
                             Ok(status) => {
                                 if status == ConnectionStatus::Closed {
                                     connection_closed = true;
@@ -74,6 +74,31 @@ pub fn handle_events(
                                 connection_closed = true;
                                 break;
                             },
+                        }
+                    }
+
+                    // Parse read buffer into commands
+                    loop {
+                        match protocol::parse(connection.read_buf()) {
+                            ParseResult::Complete(command, to_consume) => {
+                                println!("Received command {:?}", command);
+
+                                connection.drain_read_bytes(to_consume);
+                                
+                                let response = database.execute(command);
+                                let bytes = protocol::serialize(response);
+                                connection.queue_bytes(&bytes);
+                            },
+                            ParseResult::Incomplete => break,
+                            ParseResult::Error(msg) => {
+                                let bytes = protocol::serialize(
+                                    Response::Error(msg)
+                                );
+                                connection.queue_bytes(&bytes);
+
+                                connection_closed = true;
+                                break;
+                            }
                         }
                     }
 
