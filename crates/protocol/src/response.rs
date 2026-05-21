@@ -1,6 +1,8 @@
+#[derive(Debug)]
 pub enum Response {
-    Ok,
-    Value(String),
-    Error(String),
     Null,
+    Error(String),
+    Integer(i64),
+    BulkString(String),
+    SimpleString(String),
 }

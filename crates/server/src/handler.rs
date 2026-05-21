@@ -81,7 +81,7 @@ pub fn handle_events(
                     loop {
                         match protocol::parse(connection.read_buf()) {
                             ParseResult::Complete(command, to_consume) => {
-                                println!("Received command {:?}", command);
+                                //println!("Parsed command {:?}", command);
 
                                 connection.drain_read_bytes(to_consume);
                                 

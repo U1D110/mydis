@@ -17,6 +17,7 @@ impl Database {
             "GET" => self.get(cmd.args),
             "SET" => self.set(cmd.args),
             "DEL" => self.delete(cmd.args),
+            "PING" => Response::SimpleString("PONG".to_string()),
             _ => Response::Error("Unknown Command".to_string()),
         }
     }
@@ -26,7 +27,7 @@ impl Database {
             Response::Error("GET requires exactly one argument".to_string())
         } else {
             match self.data.get(&args[0]) {
-                Some(v) => Response::Value(v.clone()),
+                Some(v) => Response::BulkString(v.clone()),
                 None => Response::Null,
             }
         }
@@ -37,16 +38,18 @@ impl Database {
             Response::Error("SET requires exactly two arguments".to_string())
         } else {
             let _ = self.data.insert(args[0].clone(), args[1].clone());
-            Response::Ok
+            Response::SimpleString("OK".to_string())
         }
     }
 
     fn delete(&mut self, args: Vec<String>) -> Response {
         if args.len() != 1 {
-            Response::Error("DEL requires exactly one argument".to_string())
-        } else {
-            let _ = self.data.remove(&args[0]);
-            Response::Ok
+            return Response::Error("DEL requires exactly one argument".into());
+        } 
+        
+        match self.data.remove(&args[0]) {
+            Some(_) => Response::Integer(1),
+            None => Response::Integer(0),
         }
     }
 }

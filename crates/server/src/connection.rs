@@ -49,7 +49,9 @@ impl Connection {
                     // client disconnected
                     Ok(ConnectionStatus::Closed)
                 } else {
+                    // TODO: Maximum buffer size check
                     self.read_buf.extend_from_slice(&buf[..bytes_read]);
+                    println!("read_buf after read: {:?}", String::from_utf8_lossy(&self.read_buf));
                     Ok(ConnectionStatus::Active)
                 }
             },
