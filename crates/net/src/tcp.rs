@@ -149,7 +149,7 @@ impl TcpListener {
 
         println!("server: got connection from {}", ai);
 
-        return Ok(TcpStream { fd: new_fd });
+        Ok(TcpStream { fd: new_fd })
     }
 
     pub fn local_port(&self) -> io::Result<u16> {

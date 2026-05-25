@@ -11,9 +11,9 @@ pub enum ParseResult {
 }
 
 pub fn parse(buf: &[u8]) -> ParseResult {
-    match buf.get(0) {
+    match buf.first() {
         None => return ParseResult::Incomplete,
-        Some(b) if b != &b'*' => return ParseResult::Error("Expected an array".into()),
+        Some(b) if b != &b'*' => return ParseResult::Error("Expected an array".to_string()),
         _ => (),
     } 
 
@@ -24,7 +24,7 @@ pub fn parse(buf: &[u8]) -> ParseResult {
     };
     let num_elements = match parse_usize(&buf[pos..(pos+crlf)]) {
         Ok(n) if n > 0 => n,
-        _ => return ParseResult::Error("Invalid array length".into()),
+        _ => return ParseResult::Error("Invalid array length".to_string()),
     };
     pos += crlf + 2;
 
@@ -39,7 +39,7 @@ pub fn parse(buf: &[u8]) -> ParseResult {
             return ParseResult::Incomplete;
         };
         let Ok(str_len) = parse_usize(&buf[pos..(pos + crlf)]) else {
-            return ParseResult::Error("Invalid bulk string length".into());
+            return ParseResult::Error("Invalid bulk string length".to_string());
         };
         pos += crlf + 2;
 
@@ -50,7 +50,7 @@ pub fn parse(buf: &[u8]) -> ParseResult {
 
         let s = match std::str::from_utf8(&buf[pos..(pos + str_len)]) {
             Ok(s) => s.to_string(),
-            Err(_) => return ParseResult::Error("Invalid utf8".into()),
+            Err(_) => return ParseResult::Error("Invalid utf8".to_string()),
         };
         pos += str_len + 2;
 

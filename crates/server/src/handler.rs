@@ -46,101 +46,99 @@ pub fn handle_events(
                     }
                 }
             }
-        } else {
-            if let Entry::Occupied(mut entry) = connections.entry(event.fd()) {
-                let mut connection_closed = false;
+        } else if let Entry::Occupied(mut entry) = connections.entry(event.fd()) {
+            let mut connection_closed = false;
 
-                let connection = entry.get_mut();
+            let connection = entry.get_mut();
             
-                if event.readable() {
-                    loop {
-                        match connection.read() {
-                            Ok(status) => {
-                                if status == ConnectionStatus::Closed {
-                                    connection_closed = true;
-                                    break;
-                                }
-                                // else we are still draining the read buffer
-                            },
-                            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                                // Done reading, but connection still active
-                                if connection.has_pending_writes() {
-                                    poll.reregister(event.fd(), Interests::read_write())?;
-                                }
-                                break;
-                            },
-                            Err(err) => {
-                                eprintln!("Error reading from stream {}: {err}", event.fd());
-                                connection_closed = true;
-                                break;
-                            },
-                        }
-                    }
-
-                    // Parse read buffer into commands
-                    loop {
-                        match protocol::parse(connection.read_buf()) {
-                            ParseResult::Complete(command, to_consume) => {
-                                //println!("Parsed command {:?}", command);
-
-                                connection.drain_read_bytes(to_consume);
-                                
-                                let response = database.execute(command);
-                                let bytes = protocol::serialize(response);
-                                connection.queue_bytes(&bytes);
-                            },
-                            ParseResult::Incomplete => break,
-                            ParseResult::Error(msg) => {
-                                let bytes = protocol::serialize(
-                                    Response::Error(msg)
-                                );
-                                connection.queue_bytes(&bytes);
-
+            if event.readable() {
+                loop {
+                    match connection.read() {
+                        Ok(status) => {
+                            if status == ConnectionStatus::Closed {
                                 connection_closed = true;
                                 break;
                             }
-                        }
-                    }
-
-                    // Opportunistic write to save context switch overhead/latency
-                    match connection.pump() {
-                        // Write buffer drained, switch to read_only
-                        Ok(()) => poll.reregister(event.fd(), Interests::read_only())?,
-                        // OS send buffer full, bytes still waiting in write buffer
+                            // else we are still draining the read buffer
+                        },
                         Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                            poll.reregister(event.fd(), Interests::read_write())?;
+                            // Done reading, but connection still active
+                            if connection.has_pending_writes() {
+                                poll.reregister(event.fd(), Interests::read_write())?;
+                            }
+                            break;
                         },
                         Err(err) => {
-                            eprintln!("Write error after read: {err}");
+                            eprintln!("Error reading from stream {}: {err}", event.fd());
                             connection_closed = true;
+                            break;
+                        },
+                    }
+                }
+
+                // Parse read buffer into commands
+                loop {
+                    match protocol::parse(connection.read_buf()) {
+                        ParseResult::Complete(command, to_consume) => {
+                            //println!("Parsed command {:?}", command);
+
+                            connection.drain_read_bytes(to_consume);
+                            
+                            let response = database.execute(command);
+                            let bytes = protocol::serialize(response);
+                            connection.queue_bytes(&bytes);
+                        },
+                        ParseResult::Incomplete => break,
+                        ParseResult::Error(msg) => {
+                            let bytes = protocol::serialize(
+                                Response::Error(msg)
+                            );
+                            connection.queue_bytes(&bytes);
+
+                            connection_closed = true;
+                            break;
                         }
                     }
                 }
 
-                if event.rdhup() {
-                    connection_closed = true;
-                }
-
-                if event.writable() && !connection_closed {
-                    match connection.pump() {
-                        Ok(()) => poll.reregister(event.fd(), Interests::read_only())?,
-                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                            // Send buffer is full. No change to registered interests.
-                        },
-                        Err(err) => {
-                            eprintln!("Write error on writable wakeup: {err}");
-                            connection_closed = true;
-                        },
+                // Opportunistic write to save context switch overhead/latency
+                match connection.pump() {
+                    // Write buffer drained, switch to read_only
+                    Ok(()) => poll.reregister(event.fd(), Interests::read_only())?,
+                    // OS send buffer full, bytes still waiting in write buffer
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        poll.reregister(event.fd(), Interests::read_write())?;
+                    },
+                    Err(err) => {
+                        eprintln!("Write error after read: {err}");
+                        connection_closed = true;
                     }
                 }
+            }
 
-                if event.error() || event.hang_up() {
-                    connection_closed = true;
+            if event.rdhup() {
+                connection_closed = true;
+            }
+
+            if event.writable() && !connection_closed {
+                match connection.pump() {
+                    Ok(()) => poll.reregister(event.fd(), Interests::read_only())?,
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        // Send buffer is full. No change to registered interests.
+                    },
+                    Err(err) => {
+                        eprintln!("Write error on writable wakeup: {err}");
+                        connection_closed = true;
+                    },
                 }
+            }
+
+            if event.error() || event.hang_up() {
+                connection_closed = true;
+            }
             
-                if connection_closed {
-                    entry.remove();
-                }
+            if connection_closed {
+                entry.remove();
             }
         }   
     }
