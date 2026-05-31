@@ -8,7 +8,7 @@ use std::{
 
 use db::Database;
 use net::{Events, Interests, Poll, TcpListener};
-use protocol::{ParseResult, Response};
+use protocol::{ParseResult, Response, ErrorKind};
 
 use crate::connection::{
     Connection,
@@ -91,7 +91,9 @@ pub fn handle_events(
                         ParseResult::Incomplete => break,
                         ParseResult::Error(msg) => {
                             let bytes = protocol::serialize(
-                                Response::Error(msg)
+                                Response::Error(
+                                    ErrorKind::ProtocolError(msg)
+                                )
                             );
                             connection.queue_bytes(&bytes);
 
