@@ -1,19 +1,34 @@
+use std::fmt;
 use crate::Command;
 
-//pub enum ParseError {
-//    
-//}
+pub enum ParseError {
+    NotAnArray,
+    InvalidArrayLength,
+    InvalidBulkStringLength,
+    InvalidUtf8,   
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParseError::NotAnArray => write!(f, "not an array"),
+            ParseError::InvalidArrayLength => write!(f, "invalid array length"),
+            ParseError::InvalidBulkStringLength => write!(f, "invalid bulk string length"),
+            ParseError::InvalidUtf8 => write!(f, "invalid utf8"),
+        }
+    }
+}
 
 pub enum ParseResult {
     Complete(Command, usize),
     Incomplete,
-    Error(String), // TODO: Use ParseError?
+    Error(ParseError),
 }
 
 pub fn parse(buf: &[u8]) -> ParseResult {
     match buf.first() {
         None => return ParseResult::Incomplete,
-        Some(b) if b != &b'*' => return ParseResult::Error("Expected an array".to_string()),
+        Some(b) if b != &b'*' => return ParseResult::Error(ParseError::NotAnArray),
         _ => (),
     } 
 
@@ -24,7 +39,7 @@ pub fn parse(buf: &[u8]) -> ParseResult {
     };
     let num_elements = match parse_usize(&buf[pos..(pos+crlf)]) {
         Ok(n) if n > 0 => n,
-        _ => return ParseResult::Error("Invalid array length".to_string()),
+        _ => return ParseResult::Error(ParseError::InvalidArrayLength),
     };
     pos += crlf + 2;
 
@@ -39,7 +54,7 @@ pub fn parse(buf: &[u8]) -> ParseResult {
             return ParseResult::Incomplete;
         };
         let Ok(str_len) = parse_usize(&buf[pos..(pos + crlf)]) else {
-            return ParseResult::Error("Invalid bulk string length".to_string());
+            return ParseResult::Error(ParseError::InvalidBulkStringLength);
         };
         pos += crlf + 2;
 
@@ -50,7 +65,7 @@ pub fn parse(buf: &[u8]) -> ParseResult {
 
         let s = match std::str::from_utf8(&buf[pos..(pos + str_len)]) {
             Ok(s) => s.to_string(),
-            Err(_) => return ParseResult::Error("Invalid utf8".to_string()),
+            Err(_) => return ParseResult::Error(ParseError::InvalidUtf8),
         };
         pos += str_len + 2;
 
@@ -96,7 +111,6 @@ mod tests {
 
     #[test]
     fn should_parse_complete_command() {
-        //let input = b"GET shorty\nDRINK tea and\nTHEN\nUSE toil";
         let input = array(&["GET", "shorty"]);
 
         let ParseResult::Complete(cmd, to_consume) = parse(&input) else {
@@ -160,17 +174,27 @@ mod tests {
     #[test]
     fn should_err_on_invalid_resp() {
         // not a RESP array — plain text like old protocol
-        let ParseResult::Error(_) = parse(b"GET foo\n") else {
-            panic!("Expected Error on non-RESP input");
-        };
+        let res = parse(b"GET foo\r\n");
+        assert!(matches!(res, ParseResult::Error(ParseError::NotAnArray)));
     }
 
     #[test]
     fn should_err_on_zero_element_array() {
         // *0 is technically valid RESP but not a valid command
-        let ParseResult::Error(_) = parse(b"*0\r\n") else {
-            panic!("Expected Error on empty command array");
-        };
+        let res = parse(b"*0\r\n");
+        assert!(matches!(res, ParseResult::Error(ParseError::InvalidArrayLength)));
+    }
+
+    #[test]
+    fn should_err_on_bad_bulk_string_length() {
+        let res = parse(b"*1\r\n$-1\r\nPING\r\n");
+        assert!(matches!(res, ParseResult::Error(ParseError::InvalidBulkStringLength)));
+    }
+
+    #[test]
+    fn should_err_on_invalid_utf8() {
+        let res = parse(b"*1\r\n$1\r\n\xFF\r\n");
+        assert!(matches!(res, ParseResult::Error(ParseError::InvalidUtf8)));
     }
 
     #[test]

@@ -80,8 +80,6 @@ pub fn handle_events(
                 loop {
                     match protocol::parse(connection.read_buf()) {
                         ParseResult::Complete(command, to_consume) => {
-                            //println!("Parsed command {:?}", command);
-
                             connection.drain_read_bytes(to_consume);
                             
                             let response = database.execute(command);
@@ -89,14 +87,11 @@ pub fn handle_events(
                             connection.queue_bytes(&bytes);
                         },
                         ParseResult::Incomplete => break,
-                        ParseResult::Error(msg) => {
+                        ParseResult::Error(err) => {
                             let bytes = protocol::serialize(
-                                Response::Error(
-                                    ErrorKind::ProtocolError(msg)
-                                )
+                                Response::Error(ErrorKind::from(err))
                             );
                             connection.queue_bytes(&bytes);
-
                             connection_closed = true;
                             break;
                         }

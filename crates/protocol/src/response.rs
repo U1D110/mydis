@@ -1,3 +1,5 @@
+use crate::parser::ParseError;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum ErrorKind {
     // protocol layer
@@ -14,19 +16,23 @@ pub enum ErrorKind {
     SyntaxError,
 }
 
-impl ErrorKind {
-    pub fn message(&self) -> String {
+impl std::fmt::Display for ErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ErrorKind::UnknownCommand(msg) => format!("unknown command: {msg}"),
-            ErrorKind::WrongArity(msg) => {
-                format!("wrong arity: {msg}")
-            },
-            ErrorKind::ProtocolError(msg) => format!("protocol error: {msg}"),
-            ErrorKind::NotAnInteger => "not an integer".to_string(),
-            ErrorKind::OutOfRange => "out of range".to_string(),
-            ErrorKind::WrongType => "wrong type".to_string(),
-            ErrorKind::SyntaxError => "syntax error".to_string(),
+            ErrorKind::ProtocolError(s) => write!(f, "protocol error: {s}"),
+            ErrorKind::UnknownCommand(cmd) => write!(f, "unknown command: {cmd}"),
+            ErrorKind::WrongArity(name) => write!(f, "wrong arity: {name}"),
+            ErrorKind::NotAnInteger => write!(f, "not an integer"),
+            ErrorKind::OutOfRange => write!(f, "out of range"),
+            ErrorKind::WrongType => write!(f, "wrong type"),
+            ErrorKind::SyntaxError => write!(f, "syntax error"),
         }
+    }
+}
+
+impl From<ParseError> for ErrorKind {
+    fn from(value: ParseError) -> Self {
+        ErrorKind::ProtocolError(value.to_string())
     }
 }
 
