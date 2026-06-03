@@ -394,15 +394,6 @@ impl<C: Clock> InnerDatabase<C> {
     }
 }
 
-//impl Default for Database {
-//    fn default() -> Self {
-//        Self { 
-//            data: Default::default(),
-//            expiring_keys: Default::default()
-//        }
-//    }
-//}
-
 #[cfg(test)]
 mod tests {
     use super::*;
