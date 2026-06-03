@@ -8,12 +8,15 @@ use crate::{
 
 use std::{
     collections::HashMap, 
-    io,
+    io, 
 };
 
 use db::Database;
 use net::{
-    Events, Interests, Poll, TcpListener
+    Events,
+    Interests,
+    Poll,
+    TcpListener,
 };
 
 const EVENT_BUF_SIZE: usize = 1024;
@@ -33,7 +36,12 @@ fn main() -> io::Result<()> {
     println!("Server waiting for connections...");
 
     loop {
-        let _ = poll.wait(&mut events)?;
+        let timeout_ms = database.next_expiration_timeout();
+
+        poll.wait(&mut events, timeout_ms)?;
+
         handle_events(&events, &mut connections, &listener, &poll, &mut database)?;
+
+        database.purge_expired_keys();
     }
 }

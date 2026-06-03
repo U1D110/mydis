@@ -35,13 +35,13 @@ fn tcp_listener_accepts_and_echoes() -> io::Result<()> {
     
     for i in 0..2 {
         // Wait for first client to connect
-        poll.wait(&mut events)?;
+        poll.wait(&mut events, -1)?;
         let stream = listener.accept()?;
         assert_eq!(events.iter().count(), 1, "Expected exactly one event on accept {i}");
         poll.register(stream.as_raw_fd(), Interests::read_only())?;
 
         // Wait for client to write
-        poll.wait(&mut events)?;
+        poll.wait(&mut events, -1)?;
         assert_eq!(events.iter().count(), 1, "Expected exactly one readable event {i}");
         let mut buf = [0u8; 28];
         let n = stream.read(&mut buf)?;
@@ -49,7 +49,7 @@ fn tcp_listener_accepts_and_echoes() -> io::Result<()> {
         stream.write(&buf)?;
 
         // First client drops
-        poll.wait(&mut events)?;
+        poll.wait(&mut events, -1)?;
         assert!(events.iter().any(|e| e.rdhup()), "Expected EPOLLRDHUP from client {i} disconnect");
     }
 

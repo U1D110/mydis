@@ -123,7 +123,32 @@ impl Poll {
         Ok(())
     }
 
-    pub fn wait(&self, events: &mut Events) -> io::Result<usize> {
+    pub fn wait(&self, events: &mut Events, timeout: i32) -> io::Result<()> {
+        events.inner.clear();
+
+        let num_events = unsafe {
+            epoll_wait(
+                self.epoll_fd,
+                events.inner.as_mut_ptr(),
+                events.inner.capacity() as i32,
+                timeout,
+            )
+        };
+
+        if num_events < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                Ok(())
+            } else {
+                Err(err)
+            }
+        } else {
+            unsafe { events.inner.set_len(num_events as usize) };
+            Ok(())
+        }
+    }
+
+    pub fn wait_no_timeout(&self, events: &mut Events) -> io::Result<usize> {
         events.inner.clear();
 
         loop {
