@@ -24,6 +24,11 @@ enum ExpirationUnits {
     Milliseconds,
 }
 
+enum ExpirationType {
+    Absolute,
+    Relative,
+}
+
 pub struct Database {
     inner: InnerDatabase<SystemClock>,
 }
@@ -86,15 +91,18 @@ impl<C: Clock> InnerDatabase<C> {
                 if cmd.args.len() == 2 {
                     self.set(cmd.args[0].clone(), cmd.args[1].clone())
                 } else if cmd.args.len() == 4 {
-                    let units = match cmd.args[2].to_uppercase().as_str() {
-                        "EX" => ExpirationUnits::Seconds,
-                        "PX" => ExpirationUnits::Milliseconds,
+                    let (units, exp_type) = match cmd.args[2].to_uppercase().as_str() {
+                        "EX" => (ExpirationUnits::Seconds, ExpirationType::Relative),
+                        "PX" => (ExpirationUnits::Milliseconds, ExpirationType::Relative),
+                        "EXAT" => (ExpirationUnits::Seconds, ExpirationType::Absolute),
+                        "PXAT" => (ExpirationUnits::Milliseconds, ExpirationType::Absolute),
                         _ => return Response::Error(ErrorKind::SyntaxError),
                     };
                     self.set_with_expiration(
                         cmd.args[0].clone(),
                         cmd.args[1].clone(),
                         units,
+                        exp_type,
                         cmd.args[3].clone(),
                     )
                 } else {
@@ -121,7 +129,12 @@ impl<C: Clock> InnerDatabase<C> {
                     );
                 }
 
-                self.set_expire(&cmd.args[0], &cmd.args[1], ExpirationUnits::Seconds)
+                self.set_expire(
+                    &cmd.args[0],
+                    &cmd.args[1],
+                    ExpirationUnits::Seconds,
+                    ExpirationType::Relative,
+                )
             },
 
             "PEXPIRE" => {
@@ -131,7 +144,42 @@ impl<C: Clock> InnerDatabase<C> {
                     );
                 }
 
-                self.set_expire(&cmd.args[0], &cmd.args[1], ExpirationUnits::Milliseconds)
+                self.set_expire(
+                    &cmd.args[0],
+                    &cmd.args[1],
+                    ExpirationUnits::Milliseconds,
+                    ExpirationType::Relative,
+                )
+            },
+
+            "EXPIREAT" => {
+                if cmd.args.len() != 2 {
+                    return Response::Error(
+                        ErrorKind::WrongArity("EXPIREAT".to_string())
+                    )
+                }
+
+                self.set_expire(
+                    &cmd.args[0],
+                    &cmd.args[1],
+                    ExpirationUnits::Seconds,
+                    ExpirationType::Absolute,
+                )
+            },
+
+            "PEXPIREAT" => {
+                if cmd.args.len() != 2 {
+                    return Response::Error(
+                        ErrorKind::WrongArity("PEXPIREAT".to_string())
+                    );
+                }
+
+                self.set_expire(
+                    &cmd.args[0],
+                    &cmd.args[1],
+                    ExpirationUnits::Milliseconds,
+                    ExpirationType::Absolute,
+                )
             },
             
             "TTL" => {
@@ -235,10 +283,12 @@ impl<C: Clock> InnerDatabase<C> {
         key: String,
         value: String,
         units: ExpirationUnits,
+        exp_type: ExpirationType,
         duration: String,
     ) -> Response {
-        let new_expiration = match Self::instant_from_string(&self.clock, &duration, units, false) {
-            Ok(instant) => instant,
+        let new_expiration = match Self::instant_from_string(&self.clock, &duration, units, exp_type, false) {
+            Ok(Some(instant)) => instant,
+            Ok(None) => unreachable!(),
             Err(kind) => return Response::Error(kind),
         };
 
@@ -248,7 +298,7 @@ impl<C: Clock> InnerDatabase<C> {
             }
         }
 
-        let entry = Entry { 
+        let entry = Entry {
             value,
             expiration: Some(new_expiration),
         };
@@ -272,29 +322,47 @@ impl<C: Clock> InnerDatabase<C> {
         }
     }
 
-    fn set_expire(&mut self, key: &str, duration: &str, units: ExpirationUnits) -> Response {
+    fn set_expire(
+        &mut self,
+        key: &str,
+        duration: &str,
+        units: ExpirationUnits,
+        exp_type: ExpirationType,
+    ) -> Response {
         self.remove_if_expired(key);
 
-        if let Some(entry) = self.data.get_mut(key) {
-            let new_expiration = match Self::instant_from_string(&self.clock, duration, units, true) {
-                Ok(instant) => instant,
-                Err(kind) => return Response::Error(kind),
-            }; 
+        let existing_expiration = match self.data.get(key) {
+            Some(entry) => entry.expiration,
+            None => return Response::Integer(0),
+        };
 
-            if let Some(existing_expiration) = entry.expiration {
-                self.expiring_keys.remove(&(existing_expiration, key.to_string()));
-            }
+        let new_expiration = match Self::instant_from_string(&self.clock, duration, units, exp_type, true) {
+            Ok(opt) => opt,
+            Err(kind) => return Response::Error(kind),
+        };
 
-            self.expiring_keys.insert((new_expiration, key.to_string()));
-            entry.expiration = Some(new_expiration);
-
-            Response::Integer(1)
-        } else {
-            Response::Integer(0)
+        if let Some(exp) = existing_expiration {
+            self.expiring_keys.remove(&(exp, key.to_string()));
         }
+
+        match new_expiration {
+            None => { self.data.remove(key); },
+            Some(expiration) => {
+                self.data.get_mut(key).unwrap().expiration = Some(expiration); // key verified above; no data mutations between check and here
+                self.expiring_keys.insert((expiration, key.to_string()));
+            },
+        }
+
+        Response::Integer(1)
     }
 
-    fn instant_from_string(clock: &C, duration: &str, units: ExpirationUnits, allow_zero: bool) -> Result<Instant, ErrorKind> {
+    fn instant_from_string(
+        clock: &C,
+        duration: &str,
+        units: ExpirationUnits,
+        exp_type: ExpirationType,
+        allow_zero: bool
+    ) -> Result<Option<Instant>, ErrorKind> {
         let new_expiration = match duration.parse::<i64>() {
             Ok(n) => n,
             Err(err) => {
@@ -308,22 +376,48 @@ impl<C: Clock> InnerDatabase<C> {
                     IntErrorKind::Zero => ErrorKind::OutOfRange,
                     _ => ErrorKind::NotAnInteger,
                 };
-                
+
                 return Err(kind);
             },
         };
 
-        if !allow_zero && new_expiration == 0 || new_expiration < 0 {
-            return Err(ErrorKind::OutOfRange);
+        let mut delta = new_expiration as u64;
+
+        match exp_type {
+            ExpirationType::Absolute => {
+                let now = match units {
+                    ExpirationUnits::Seconds => clock.now_unix_secs(),
+                    ExpirationUnits::Milliseconds => clock.now_unix_millis(),
+                };
+
+                if delta <= now {
+                    if allow_zero {
+                        return Ok(None);
+                    } else {
+                        return Err(ErrorKind::OutOfRange);
+                    }
+                }
+
+                delta -= now;
+            },
+            ExpirationType::Relative => {
+                if new_expiration <= 0 {
+                    if allow_zero {
+                        return Ok(None);
+                    } else {
+                        return Err(ErrorKind::OutOfRange);
+                    }
+                }
+            },
         }
 
         let d = match units {
-            ExpirationUnits::Seconds => Duration::from_secs(new_expiration as u64),
-            ExpirationUnits::Milliseconds => Duration::from_millis(new_expiration as u64),
+            ExpirationUnits::Seconds => Duration::from_secs(delta),
+            ExpirationUnits::Milliseconds => Duration::from_millis(delta),
         };
 
         match clock.now().checked_add(d) {
-            Some(instant) => Ok(instant),
+            Some(instant) => Ok(Some(instant)),
             None => Err(ErrorKind::OutOfRange),
         }
     }
@@ -538,7 +632,7 @@ mod tests {
         assert!(matches!(response, Response::Integer(1)));
 
         let response = db.execute(command("PTTL", &["k"]));
-        assert!(matches!(response, Response::Integer(ttl) if ttl >= 0));
+        assert!(matches!(response, Response::Integer(ttl) if ttl == 100));
 
         let response = db.execute(command("PERSIST", &["k"]));
         assert!(matches!(response, Response::Integer(1)));
@@ -549,6 +643,79 @@ mod tests {
         db.clock.advance(Duration::from_millis(110));
         let response = db.execute(command("GET", &["k"]));
         assert!(matches!(response, Response::BulkString(ref s) if s == "v"));
+    }
+
+    #[test]
+    fn expireat_behavior() {
+        let mut db = InnerDatabase::for_test();
+
+        db.execute(command("SET", &["k", "v"]));
+        
+        let deadline = db.clock.now_unix_millis() + 100;
+        let response = db.execute(command("PEXPIREAT", &["k", deadline.to_string().as_str()]));
+        assert!(matches!(response, Response::Integer(1)));
+
+        let response = db.execute(command("PTTL", &["k"]));
+        assert!(matches!(response, Response::Integer(ttl) if ttl == 100));
+
+        db.clock.advance(Duration::from_millis(50));
+        let response = db.execute(command("GET", &["k"]));
+        assert!(matches!(response, Response::BulkString(ref s) if s == "v"));
+
+        db.clock.advance(Duration::from_millis(50));
+        let response = db.execute(command("GET", &["k"]));
+        assert!(matches!(response, Response::Null));
+    }
+
+    #[test]
+    fn expireat_seconds_behavior() {
+        let mut db = InnerDatabase::for_test();
+
+        db.execute(command("SET", &["k", "v"]));
+
+        let deadline = db.clock.now_unix_secs() + 1;
+        let response = db.execute(command("EXPIREAT", &["k", deadline.to_string().as_str()]));
+        assert!(matches!(response, Response::Integer(1)));
+
+        let response = db.execute(command("TTL", &["k"]));
+        assert!(matches!(response, Response::Integer(1)));
+
+        db.clock.advance(Duration::from_secs(1));
+        let response = db.execute(command("GET", &["k"]));
+        assert!(matches!(response, Response::Null));
+    }
+
+    #[test]
+    fn set_exat_behavior() {
+        let mut db = InnerDatabase::for_test();
+
+        let deadline = db.clock.now_unix_secs() + 1;
+        let response = db.execute(command("SET", &["k", "v", "EXAT", deadline.to_string().as_str()]));
+        assert!(matches!(response, Response::SimpleString(ref s) if s == "OK"));
+
+        let response = db.execute(command("GET", &["k"]));
+        assert!(matches!(response, Response::BulkString(ref s) if s == "v"));
+
+        db.clock.advance(Duration::from_secs(1));
+        let response = db.execute(command("GET", &["k"]));
+        assert!(matches!(response, Response::Null));
+    }
+
+    #[test]
+    fn set_pxat_behavior() {
+        let mut db = InnerDatabase::for_test();
+
+        let deadline = db.clock.now_unix_millis() + 100;
+        let response = db.execute(command("SET", &["k", "v", "PXAT", deadline.to_string().as_str()]));
+        assert!(matches!(response, Response::SimpleString(ref s) if s == "OK"));
+
+        db.clock.advance(Duration::from_millis(50));
+        let response = db.execute(command("GET", &["k"]));
+        assert!(matches!(response, Response::BulkString(ref s) if s == "v"));
+
+        db.clock.advance(Duration::from_millis(50));
+        let response = db.execute(command("GET", &["k"]));
+        assert!(matches!(response, Response::Null));
     }
 
     #[test]
