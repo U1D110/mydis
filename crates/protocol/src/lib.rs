@@ -4,6 +4,6 @@ mod response;
 mod serializer;
 
 pub use command::Command;
-pub use parser::{parse, ParseResult};
+pub use parser::{ParseResult, parse};
 pub use response::{ErrorKind, Response};
 pub use serializer::serialize;

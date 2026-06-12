@@ -1,11 +1,11 @@
-use std::fmt;
 use crate::Command;
+use std::fmt;
 
 pub enum ParseError {
     NotAnArray,
     InvalidArrayLength,
     InvalidBulkStringLength,
-    InvalidUtf8,   
+    InvalidUtf8,
 }
 
 impl fmt::Display for ParseError {
@@ -30,14 +30,14 @@ pub fn parse(buf: &[u8]) -> ParseResult {
         None => return ParseResult::Incomplete,
         Some(b) if b != &b'*' => return ParseResult::Error(ParseError::NotAnArray),
         _ => (),
-    } 
+    }
 
     // *<num-elements>\r\n<element-1>...<element-n>
     let mut pos: usize = 1;
     let Some(crlf) = find_crlf(&buf[pos..]) else {
         return ParseResult::Incomplete;
     };
-    let num_elements = match parse_usize(&buf[pos..(pos+crlf)]) {
+    let num_elements = match parse_usize(&buf[pos..(pos + crlf)]) {
         Ok(n) if n > 0 => n,
         _ => return ParseResult::Error(ParseError::InvalidArrayLength),
     };
@@ -182,13 +182,19 @@ mod tests {
     fn should_err_on_zero_element_array() {
         // *0 is technically valid RESP but not a valid command
         let res = parse(b"*0\r\n");
-        assert!(matches!(res, ParseResult::Error(ParseError::InvalidArrayLength)));
+        assert!(matches!(
+            res,
+            ParseResult::Error(ParseError::InvalidArrayLength)
+        ));
     }
 
     #[test]
     fn should_err_on_bad_bulk_string_length() {
         let res = parse(b"*1\r\n$-1\r\nPING\r\n");
-        assert!(matches!(res, ParseResult::Error(ParseError::InvalidBulkStringLength)));
+        assert!(matches!(
+            res,
+            ParseResult::Error(ParseError::InvalidBulkStringLength)
+        ));
     }
 
     #[test]

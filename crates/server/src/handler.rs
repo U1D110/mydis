@@ -1,20 +1,13 @@
 use std::{
-    collections::{
-        HashMap,
-        hash_map::Entry,
-    },
+    collections::{HashMap, hash_map::Entry},
     io,
 };
 
 use db::Database;
 use net::{Events, Interests, Poll, TcpListener};
-use protocol::{ParseResult, Response, ErrorKind};
+use protocol::{ErrorKind, ParseResult, Response};
 
-use crate::connection::{
-    Connection,
-    ConnectionStatus,
-};
-
+use crate::connection::{Connection, ConnectionStatus};
 
 pub fn handle_events(
     events: &Events,
@@ -35,11 +28,11 @@ pub fn handle_events(
                         let conn = Connection::new(stream);
 
                         connections.insert(conn.id(), conn);
-                    },
+                    }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                         // kernel accept queue is empty, time to wait again
                         break;
-                    },
+                    }
                     Err(e) => {
                         eprintln!("Failed to accept connection: {}", e);
                         break;
@@ -50,7 +43,7 @@ pub fn handle_events(
             let mut connection_closed = false;
 
             let connection = entry.get_mut();
-            
+
             if event.readable() {
                 loop {
                     match connection.read() {
@@ -60,19 +53,19 @@ pub fn handle_events(
                                 break;
                             }
                             // else we are still draining the read buffer
-                        },
+                        }
                         Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                             // Done reading, but connection still active
                             if connection.has_pending_writes() {
                                 poll.reregister(event.fd(), Interests::read_write())?;
                             }
                             break;
-                        },
+                        }
                         Err(err) => {
                             eprintln!("Error reading from stream {}: {err}", event.fd());
                             connection_closed = true;
                             break;
-                        },
+                        }
                     }
                 }
 
@@ -81,16 +74,14 @@ pub fn handle_events(
                     match protocol::parse(connection.read_buf()) {
                         ParseResult::Complete(command, to_consume) => {
                             connection.drain_read_bytes(to_consume);
-                            
+
                             let response = database.execute(command);
                             let bytes = protocol::serialize(response);
                             connection.queue_bytes(&bytes);
-                        },
+                        }
                         ParseResult::Incomplete => break,
                         ParseResult::Error(err) => {
-                            let bytes = protocol::serialize(
-                                Response::Error(ErrorKind::from(err))
-                            );
+                            let bytes = protocol::serialize(Response::Error(ErrorKind::from(err)));
                             connection.queue_bytes(&bytes);
                             connection_closed = true;
                             break;
@@ -105,7 +96,7 @@ pub fn handle_events(
                     // OS send buffer full, bytes still waiting in write buffer
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                         poll.reregister(event.fd(), Interests::read_write())?;
-                    },
+                    }
                     Err(err) => {
                         eprintln!("Write error after read: {err}");
                         connection_closed = true;
@@ -122,22 +113,22 @@ pub fn handle_events(
                     Ok(()) => poll.reregister(event.fd(), Interests::read_only())?,
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                         // Send buffer is full. No change to registered interests.
-                    },
+                    }
                     Err(err) => {
                         eprintln!("Write error on writable wakeup: {err}");
                         connection_closed = true;
-                    },
+                    }
                 }
             }
 
             if event.error() || event.hang_up() {
                 connection_closed = true;
             }
-            
+
             if connection_closed {
                 entry.remove();
             }
-        }   
+        }
     }
 
     Ok(())

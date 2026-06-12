@@ -1,15 +1,11 @@
 use std::{
-    ffi::{
-        CStr,
-        CString,
-    },
-    ptr
+    ffi::{CStr, CString},
+    ptr,
 };
 
 use libc::{
-    accept, addrinfo, c_char, c_void, bind, close, freeaddrinfo, 
-    gai_strerror, getaddrinfo, gethostname, listen, perror, setsockopt, signal, 
-    sockaddr, sockaddr_storage, socket, socklen_t,
+    accept, addrinfo, bind, c_char, c_void, close, freeaddrinfo, gai_strerror, getaddrinfo,
+    gethostname, listen, perror, setsockopt, signal, sockaddr, sockaddr_storage, socket, socklen_t,
 };
 
 fn main() {
@@ -23,7 +19,7 @@ fn main() {
         signal(libc::SIGCHLD, libc::SIG_IGN);
 
         let mut hints: addrinfo = std::mem::zeroed();
-        hints.ai_family = libc::AF_UNSPEC;  // IPv4 or IPv6
+        hints.ai_family = libc::AF_UNSPEC; // IPv4 or IPv6
         hints.ai_socktype = libc::SOCK_STREAM;
         hints.ai_flags = libc::AI_PASSIVE;
 
@@ -121,7 +117,7 @@ fn main() {
             let new_fd = accept(
                 sockfd,
                 &mut their_addr as *mut _ as *mut sockaddr,
-                &mut sin_size
+                &mut sin_size,
             );
 
             if new_fd == -1 {
@@ -133,12 +129,12 @@ fn main() {
                     let sockaddr = (&their_addr) as *const _ as *const libc::sockaddr_in;
                     let ip_ptr = &(*sockaddr).sin_addr as *const libc::in_addr;
                     ipv4_to_string(ip_ptr)
-                },
+                }
                 libc::AF_INET6 => {
                     let sockaddr = (&their_addr) as *const _ as *const libc::sockaddr_in6;
                     let ip_ptr = &(*sockaddr).sin6_addr as *const libc::in6_addr;
                     ipv6_to_string(ip_ptr)
-                },
+                }
                 _ => String::from("Unknown"),
             };
 
@@ -175,12 +171,8 @@ fn main() {
             // Echo loop
             loop {
                 // 1. Read data from client
-                let bytes_received = libc::recv(
-                    new_fd,
-                    buffer.as_mut_ptr() as *mut c_void,
-                    buffer.len(),
-                    0,
-                );
+                let bytes_received =
+                    libc::recv(new_fd, buffer.as_mut_ptr() as *mut c_void, buffer.len(), 0);
 
                 if bytes_received < 0 {
                     perror(b"recv\0".as_ptr() as *const c_char);

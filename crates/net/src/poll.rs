@@ -1,10 +1,4 @@
-use libc::{
-    close,
-    epoll_create1,
-    epoll_ctl,
-    epoll_event,
-    epoll_wait,
-};
+use libc::{close, epoll_create1, epoll_ctl, epoll_event, epoll_wait};
 
 use std::io;
 
@@ -16,8 +10,8 @@ pub struct Event {
 impl Event {
     pub fn from_epoll(evt: epoll_event) -> Self {
         Event {
-            flags:  evt.events,
-            fd:     evt.u64 as i32,
+            flags: evt.events,
+            fd: evt.u64 as i32,
         }
     }
 
@@ -69,11 +63,17 @@ pub struct Interests {
 
 impl Interests {
     pub fn read_only() -> Self {
-        Self { read: true, write: false }
+        Self {
+            read: true,
+            write: false,
+        }
     }
 
     pub fn read_write() -> Self {
-        Self { read: true, write: true }
+        Self {
+            read: true,
+            write: true,
+        }
     }
 }
 
@@ -100,11 +100,11 @@ impl Poll {
 
     fn poll_ctl(&self, op: i32, fd: i32, interests: Interests) -> io::Result<()> {
         let mut flags = (libc::EPOLLET | libc::EPOLLRDHUP) as u32;
-        if interests.read { 
-            flags |= libc::EPOLLIN as u32; 
+        if interests.read {
+            flags |= libc::EPOLLIN as u32;
         }
-        if interests.write { 
-            flags |= libc::EPOLLOUT as u32; 
+        if interests.write {
+            flags |= libc::EPOLLOUT as u32;
         }
 
         let mut event = epoll_event {
@@ -112,9 +112,7 @@ impl Poll {
             u64: fd as u64,
         };
 
-        let res = unsafe {
-            epoll_ctl(self.epoll_fd, op, fd, &mut event)
-        };
+        let res = unsafe { epoll_ctl(self.epoll_fd, op, fd, &mut event) };
 
         if res < 0 {
             return Err(io::Error::last_os_error());
@@ -157,14 +155,14 @@ impl Poll {
                     self.epoll_fd,
                     events.inner.as_mut_ptr(),
                     events.inner.capacity() as i32,
-                    -1
+                    -1,
                 )
             };
 
             if num_events < 0 {
                 let err = io::Error::last_os_error();
 
-                // System calls can be interrupted by OS signals. So if this 
+                // System calls can be interrupted by OS signals. So if this
                 // happens we just keep looping and try epoll_wait again.
                 if err.raw_os_error() == Some(libc::EINTR) {
                     continue;

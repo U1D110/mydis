@@ -18,7 +18,7 @@ pub struct Connection {
 
 impl Connection {
     pub fn new(stream: TcpStream) -> Self {
-        Connection { 
+        Connection {
             stream,
             read_buf: Vec::with_capacity(READ_BUF_SIZE),
             write_buf: Vec::with_capacity(WRITE_BUF_SIZE),
@@ -51,10 +51,13 @@ impl Connection {
                 } else {
                     // TODO: Maximum buffer size check
                     self.read_buf.extend_from_slice(&buf[..bytes_read]);
-                    println!("read_buf after read: {:?}", String::from_utf8_lossy(&self.read_buf));
+                    println!(
+                        "read_buf after read: {:?}",
+                        String::from_utf8_lossy(&self.read_buf)
+                    );
                     Ok(ConnectionStatus::Active)
                 }
-            },
+            }
             Err(err) => Err(err),
         }
     }
@@ -81,8 +84,8 @@ impl Connection {
                     // Partial write - treat like WouldBlock
                     Err(io::Error::from(io::ErrorKind::WouldBlock))
                 }
-            },
-            Err(err) => Err(err)
+            }
+            Err(err) => Err(err),
         }
     }
 }
