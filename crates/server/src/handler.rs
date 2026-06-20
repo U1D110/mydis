@@ -7,7 +7,7 @@ use db::Database;
 use net::{Events, Interests, Poll, TcpListener};
 use protocol::{ErrorKind, ParseResult, Response};
 
-use crate::connection::{Connection, ConnectionStatus};
+use crate::{aof::{Aof, should_persist}, connection::{Connection, ConnectionStatus}};
 
 pub fn handle_events(
     events: &Events,
@@ -15,6 +15,7 @@ pub fn handle_events(
     listener: &TcpListener,
     poll: &Poll,
     database: &mut Database,
+    aof: &mut Aof,
 ) -> io::Result<()> {
     for event in events.iter() {
         if event.fd() == listener.as_raw_fd() {
@@ -75,7 +76,16 @@ pub fn handle_events(
                         ParseResult::Complete(command, to_consume) => {
                             connection.drain_read_bytes(to_consume);
 
-                            let response = database.execute(command);
+                            let response = database.execute(&command);
+                            
+                            if should_persist(&command, &response) {
+                                let bytes = command.to_resp_bytes();
+                                
+                                if let Err(e) = aof.append(&bytes) {
+                                    eprintln!("AOF write error: {e}");
+                                }
+                            }
+
                             let bytes = protocol::serialize(response);
                             connection.queue_bytes(&bytes);
                         }

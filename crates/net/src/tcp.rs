@@ -106,23 +106,6 @@ impl TcpListener {
 
         set_nonblocking(new_fd)?;
 
-        // TODO: This should be logged
-        let ai = match their_addr.ss_family as i32 {
-            libc::AF_INET => {
-                let sockaddr = (&their_addr) as *const _ as *const libc::sockaddr_in;
-                let ip_ptr = unsafe { &(*sockaddr).sin_addr as *const libc::in_addr };
-                ipv4_to_string(ip_ptr)
-            }
-            libc::AF_INET6 => {
-                let sockaddr = (&their_addr) as *const _ as *const libc::sockaddr_in6;
-                let ip_ptr = unsafe { &(*sockaddr).sin6_addr as *const libc::in6_addr };
-                ipv6_to_string(ip_ptr)
-            }
-            _ => String::from("Unknown"),
-        };
-
-        println!("server: got connection from {}", ai);
-
         Ok(TcpStream { fd: new_fd })
     }
 
@@ -259,16 +242,6 @@ impl Drop for TcpStream {
             }
         }
     }
-}
-
-fn ipv4_to_string(addr: *const libc::in_addr) -> String {
-    let addr = u32::from_be(unsafe { (*addr).s_addr });
-    std::net::Ipv4Addr::from(addr).to_string()
-}
-
-fn ipv6_to_string(addr: *const libc::in6_addr) -> String {
-    let segments = unsafe { (*addr).s6_addr };
-    std::net::Ipv6Addr::from(segments).to_string()
 }
 
 fn set_nonblocking(fd: i32) -> io::Result<()> {
