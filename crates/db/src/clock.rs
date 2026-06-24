@@ -1,9 +1,7 @@
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 pub(crate) trait Clock {
-    fn now(&self) -> Instant;
-    fn now_unix_secs(&self) -> u64;
-    fn now_unix_millis(&self) -> u64;
+    fn now(&self) -> Duration;
 }
 
 pub(crate) struct SystemClock;
@@ -17,57 +15,34 @@ impl SystemClock {
 }
 
 impl Clock for SystemClock {
-    fn now(&self) -> Instant {
-        Instant::now()
-    }
-
-    fn now_unix_secs(&self) -> u64 {
-        self.now_unix().as_secs()
-    }
-
-    fn now_unix_millis(&self) -> u64 {
-        self.now_unix().as_millis() as u64
+    fn now(&self) -> Duration {
+        self.now_unix()
     }
 }
 
 #[cfg(test)]
 pub(crate) struct TestClock {
-    now: Instant,
-    now_unix: SystemTime,
+    now: SystemTime,
 }
 
 #[cfg(test)]
 impl TestClock {
     pub fn new() -> Self {
         Self {
-            now: Instant::now(),
-            now_unix: SystemTime::now(),
+            now: SystemTime::now(),
         }
     }
 
     pub fn advance(&mut self, duration: Duration) {
         self.now += duration;
-        self.now_unix += duration;
     }
 }
 
 #[cfg(test)]
 impl Clock for TestClock {
-    fn now(&self) -> Instant {
+    fn now(&self) -> Duration {
         self.now
-    }
-
-    fn now_unix_secs(&self) -> u64 {
-        self.now_unix
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
-            .as_secs()
-    }
-
-    fn now_unix_millis(&self) -> u64 {
-        self.now_unix
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64
     }
 }
