@@ -1,7 +1,7 @@
 use std::{fs::{File, OpenOptions}, io::{self, Write}, path::Path};
 
 use db::Database;
-use protocol::{Command, ParseResult, Response};
+use protocol::ParseResult;
 
 pub struct Aof {
     file: File,
@@ -29,19 +29,6 @@ impl Aof {
     }
 }
 
-pub fn should_persist(command: &Command, response: &Response) -> bool {
-    match command.name.as_str() {
-        "SET" => matches!(response, Response::SimpleString(s) if s == "OK"),
-        "DEL" => matches!(response, Response::Integer(1)),
-        "EXPIRE" => matches!(response, Response::Integer(1)),
-        "PEXPIRE" => matches!(response, Response::Integer(1)),
-        "EXPIREAT" => matches!(response, Response::Integer(1)),
-        "PEXPIREAT" => matches!(response, Response::Integer(1)),
-        "PERSIST" => matches!(response, Response::Integer(1)),
-        _ => false
-    }
-}
-
 pub fn replay<P: AsRef<Path>>(path: P, database: &mut Database) -> io::Result<u64> {
     // Read file into memory. Fine for the scale of this project.
     let bytes = match std::fs::read(path) {
@@ -54,7 +41,7 @@ pub fn replay<P: AsRef<Path>>(path: P, database: &mut Database) -> io::Result<u6
     while offset < bytes.len() {
         match protocol::parse(&bytes[offset..]) {
             ParseResult::Complete(command, consumed) => {
-                let _ = database.execute(&command);
+                let _ = database.execute(command);
                 offset += consumed;
             }
             ParseResult::Incomplete => break, // truncated tail - crashed mid write
