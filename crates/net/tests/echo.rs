@@ -10,7 +10,7 @@ fn tcp_listener_accepts_and_echoes() -> io::Result<()> {
     poll.register(listener.as_raw_fd(), Interests::read_only())?;
 
     let handle = std::thread::spawn(move || {
-        let client = TcpStream::connect("127.0.0.1", port.to_string().as_str())
+        let client = TcpStream::connect("127.0.0.1", &port.to_string())
             .expect("Failed to connect to server");
         client
             .write(b"Hello, Manuel! This is Jeff.")
@@ -22,7 +22,7 @@ fn tcp_listener_accepts_and_echoes() -> io::Result<()> {
         assert_eq!(&buf, b"Hello, Manuel! This is Jeff.");
         drop(client);
 
-        let client = TcpStream::connect("127.0.0.1", port.to_string().as_str())
+        let client = TcpStream::connect("127.0.0.1", &port.to_string())
             .expect("Failed to connect to server");
         client
             .write(b"Hello, Manuel! This is Bort.")

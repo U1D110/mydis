@@ -5,6 +5,8 @@ use std::{
     num::IntErrorKind,
 };
 
+const MAX_POLL_INTERVAL_MS: u64 = 100;
+
 struct Entry {
     value: String,
     expiration_ms: Option<u64>,
@@ -284,12 +286,8 @@ impl<C: Clock> InnerDatabase<C> {
 
         match self.expiring_keys.first() {
             Some((expiration, _)) => {
-                if expiration < &now {
-                    0
-                } else {
-                    let ms = *expiration - now;
-                    std::cmp::min(ms, 100) as i32
-                }
+                let ms = expiration.saturating_sub(now);
+                std::cmp::min(ms, MAX_POLL_INTERVAL_MS) as i32
             }
             None => -1,
         }
@@ -729,7 +727,7 @@ mod tests {
         db.execute(command("SET", &["k", "v"]));
 
         let deadline = db.clock.now().as_millis() as u64 + 100;
-        let response = db.execute(command("PEXPIREAT", &["k", deadline.to_string().as_str()])).response;
+        let response = db.execute(command("PEXPIREAT", &["k", &deadline.to_string()])).response;
         assert!(matches!(response, Response::Integer(1)));
 
         let response = db.execute(command("PTTL", &["k"])).response;
@@ -751,7 +749,7 @@ mod tests {
         db.execute(command("SET", &["k", "v"]));
 
         let deadline = db.clock.now().as_secs() + 1;
-        let response = db.execute(command("EXPIREAT", &["k", deadline.to_string().as_str()])).response;
+        let response = db.execute(command("EXPIREAT", &["k", &deadline.to_string()])).response;
         assert!(matches!(response, Response::Integer(1)));
 
         let response = db.execute(command("TTL", &["k"])).response;
@@ -769,7 +767,7 @@ mod tests {
         let deadline = db.clock.now().as_secs() + 1;
         let response = db.execute(command(
             "SET",
-            &["k", "v", "EXAT", deadline.to_string().as_str()],
+            &["k", "v", "EXAT", &deadline.to_string()],
         )).response;
         assert!(matches!(response, Response::SimpleString(ref s) if s == "OK"));
 
@@ -788,7 +786,7 @@ mod tests {
         let deadline = db.clock.now().as_millis() as u64 + 100;
         let response = db.execute(command(
             "SET",
-            &["k", "v", "PXAT", deadline.to_string().as_str()],
+            &["k", "v", "PXAT", &deadline.to_string()],
         )).response;
         assert!(matches!(response, Response::SimpleString(ref s) if s == "OK"));
 
@@ -850,5 +848,36 @@ mod tests {
         db.clock.advance(Duration::from_millis(1100));
         let response = db.execute(command("GET", &["swap"])).response;
         assert!(matches!(response, Response::BulkString(ref s) if s == "two"));
+    }
+
+    #[test]
+    fn next_expiration_is_negative_one_when_no_expiring_keys() {
+        let mut db = InnerDatabase::for_test();
+        db.execute(command("SET", &["key", "value"]));
+        assert_eq!(db.next_expiration_timeout(), -1, "Next expiration should have been -1");
+    }
+
+    #[test]
+    fn next_expiration_is_capped() {
+        let mut db = InnerDatabase::for_test();
+        let exp = MAX_POLL_INTERVAL_MS * 2;
+        db.execute(command("SET", &["key", "value", "PX", &exp.to_string()]));
+        assert_eq!(db.next_expiration_timeout(), MAX_POLL_INTERVAL_MS as i32);
+    }
+
+    #[test]
+    fn next_expiration_is_below_cap() {
+        let mut db = InnerDatabase::for_test();
+        let exp = MAX_POLL_INTERVAL_MS / 2;
+        db.execute(command("SET", &["key", "value", "PX", &exp.to_string()]));
+        assert_eq!(db.next_expiration_timeout(), exp as i32);
+    }
+
+    #[test]
+    fn next_expiration_is_zero_when_key_already_expired() {
+        let mut db = InnerDatabase::for_test();
+        db.execute(command("SET", &["key", "value", "PX", "50"]));
+        db.clock.advance(Duration::from_millis(60));
+        assert_eq!(db.next_expiration_timeout(), 0);
     }
 }
