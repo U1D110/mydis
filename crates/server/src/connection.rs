@@ -14,6 +14,7 @@ pub struct Connection {
     stream: TcpStream,
     read_buf: Vec<u8>, // Maybe we use BytesMut from `bytes` crate later on
     write_buf: Vec<u8>,
+    pending_flush: Option<Vec<u8>>,
 }
 
 impl Connection {
@@ -22,11 +23,16 @@ impl Connection {
             stream,
             read_buf: Vec::with_capacity(READ_BUF_SIZE),
             write_buf: Vec::with_capacity(WRITE_BUF_SIZE),
+            pending_flush: None,
         }
     }
 
     pub fn id(&self) -> i32 {
         self.stream.as_raw_fd()
+    }
+
+    pub fn is_blocked(&self) -> bool {
+        self.pending_flush.is_some()
     }
 
     pub fn has_pending_writes(&self) -> bool {
@@ -35,6 +41,20 @@ impl Connection {
 
     pub fn read_buf(&self) -> &[u8] {
         &self.read_buf
+    }
+
+    pub fn block_on_flush(&mut self, bytes: Vec<u8>) {
+        self.pending_flush = Some(bytes);
+    }
+
+    pub fn resume_after_flush(&mut self) {
+        if let Some(bytes) = self.pending_flush.take() {
+            self.queue_bytes(&bytes);
+        }
+    }
+
+    pub fn discard_pending_flush(&mut self) {
+        self.pending_flush = None
     }
 
     pub fn drain_read_bytes(&mut self, num_bytes: usize) {

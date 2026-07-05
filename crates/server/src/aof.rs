@@ -1,31 +1,103 @@
-use std::{fs::{File, OpenOptions}, io::{self, Write}, path::Path};
+use std::{fs::{File, OpenOptions}, io::{self, Write}, path::Path, sync::mpsc::{Receiver, Sender, channel}, thread::{self, JoinHandle}};
 
 use db::Database;
+use net::{Notifier, Wakeup};
 use protocol::ParseResult;
 
 pub struct Aof {
-    file: File,
+    tx: Sender<FlushRequest>,
+    worker: JoinHandle<()>,
+    wakeup: Wakeup,
+    completions: Receiver<Completion>,
+}
+
+pub struct FlushRequest {
+    pub fd: i32,
+    pub bytes: Vec<u8>,
+}
+
+pub struct Completion {
+    pub fd: i32,    // the connection whose write finished
+    pub result: io::Result<()>, // did worker succeed (write_all + sync_data)?
 }
 
 impl Aof {
-    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Aof> {
+    pub fn open<P: AsRef<Path>>(path: P, valid_len: u64) -> io::Result<Aof> {
         let file = OpenOptions::new()
             .append(true)
             .create(true)
             .open(path)?;
 
+        file.set_len(valid_len)?;
         file.sync_data()?;
 
-        Ok(Aof { file })
+        let wakeup = Wakeup::new()?;
+        let notifier = wakeup.notifier();
+
+        let (request_tx, request_rx) = channel::<FlushRequest>();
+        let (completion_tx, completion_rx) = channel::<Completion>();
+        let worker = thread::spawn(move || worker_loop(file, request_rx, completion_tx, notifier));
+
+        Ok(Aof { 
+            tx: request_tx,
+            worker,
+            wakeup,
+            completions: completion_rx, 
+        })
     }
 
-    pub fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.file.write_all(bytes)?;
-        self.file.sync_data()
+    pub fn submit(&self, req: FlushRequest) -> io::Result<()> {
+        self.tx
+            .send(req)
+            .map_err(|_| io::Error::other("aof worker has stopped"))
     }
 
-    pub fn truncate(&self, length: u64) -> io::Result<()> {
-        self.file.set_len(length)
+    pub fn shutdown(self) {
+        let Aof { 
+            tx, 
+            worker,
+            // Using actual binding with prepended underscore both to avoid warnings
+            // and so that these are not dropped until they go out of scope with
+            // the end of the function. Using a plain underscore would result in the 
+            // values being immediately dropped, and we do not want the fd of the 
+            // Wakeup to be closed until after we have joined the worker because it 
+            // could otherwise notify epoll using reused fd.
+            wakeup: _wakeup,
+            completions: _completions,
+        } = self;
+        drop(tx);
+        let _ = worker.join();
+    }
+
+    pub fn notify_fd(&self) -> i32 {
+        self.wakeup.as_raw_fd()
+    }
+
+    pub fn drain_completions(&self) -> io::Result<Vec<Completion>> {
+        self.wakeup.drain()?;
+        let mut out = Vec::new();
+        while let Ok(c) = self.completions.try_recv() {
+            out.push(c);
+        }
+        Ok(out)
+    }
+}
+
+fn worker_loop(
+    mut file: File,
+    request_receiver: Receiver<FlushRequest>,
+    completion_sender: Sender<Completion>,
+    notifier: Notifier,
+) {
+    for req in request_receiver {
+        let result = file
+            .write_all(&req.bytes)
+            .and_then(|_| file.sync_data());
+
+        // Let Aof know we completed.
+        let _ = completion_sender.send(Completion { fd: req.fd, result });
+        // Let event loop (epoll) know that we have Completions to process.
+        let _ = notifier.notify();
     }
 }
 

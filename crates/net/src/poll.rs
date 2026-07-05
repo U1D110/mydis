@@ -1,4 +1,4 @@
-use libc::{close, epoll_create1, epoll_ctl, epoll_event, epoll_wait};
+use libc::{EFD_CLOEXEC, EFD_NONBLOCK, c_void, close, epoll_create1, epoll_ctl, epoll_event, epoll_wait};
 
 use std::io;
 
@@ -182,6 +182,78 @@ impl Drop for Poll {
     fn drop(&mut self) {
         if self.epoll_fd != -1 {
             unsafe { close(self.epoll_fd) };
+        }
+    }
+}
+
+// Copy used by worker thread to signal. Does not own the fd.
+#[derive(Clone, Copy)]
+pub struct Notifier {
+    fd: i32,
+}
+
+impl Notifier {
+    pub fn notify(&self) -> io::Result<()> {
+        let one: u64 = 1;
+        let n = unsafe { libc::write(self.fd, &one as *const _ as *const c_void, 8) };
+        if n < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+pub struct Wakeup {
+    fd: i32,
+}
+
+impl Wakeup {
+    pub fn new() -> io::Result<Wakeup> {
+        let fd = unsafe { libc::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC) };
+        if fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(Wakeup { fd })
+        }
+    }
+
+    pub fn as_raw_fd(&self) -> i32 {
+        self.fd
+    }
+
+    pub fn notifier(&self) -> Notifier {
+        Notifier { fd: self.fd }
+    }
+
+    pub fn drain(&self) -> io::Result<()> {
+        loop {
+            let mut buf: u64 = 0;
+            let n = unsafe { libc::read(self.fd, &mut buf as *mut _ as *mut c_void, 8) };
+            match n {
+                8 => return Ok(()),
+                
+                -1 => {
+                    let e = io::Error::last_os_error();
+                    match e.raw_os_error() {
+                        Some(libc::EINTR) => continue,
+                        Some(libc::EAGAIN) => return Ok(()),
+                        _ => return Err(e),
+                    }
+                }
+
+                _ => {
+                    return Err(io::Error::other("unexpected eventfd read size: {n}"));
+                }
+            } 
+        }
+    }
+}
+
+impl Drop for Wakeup {
+    fn drop(&mut self) {
+        if self.fd != -1 {
+            unsafe { close(self.fd) };
         }
     }
 }
