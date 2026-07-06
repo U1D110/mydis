@@ -4,12 +4,11 @@ use libc::{
 };
 
 use std::{
-    ffi::{CStr, CString},
-    io, ptr,
+    ffi::{CStr, CString}, io, os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd}, ptr,
 };
 
 pub struct TcpListener {
-    fd: i32,
+    fd: OwnedFd,
 }
 
 impl TcpListener {
@@ -83,9 +82,11 @@ impl TcpListener {
             return Err(err);
         }
 
-        set_nonblocking(sockfd)?;
+        let fd = unsafe { OwnedFd::from_raw_fd(sockfd) };
 
-        Ok(TcpListener { fd: sockfd })
+        set_nonblocking(fd.as_fd())?;
+
+        Ok(TcpListener { fd })
     }
 
     pub fn accept(&self) -> io::Result<TcpStream> {
@@ -94,7 +95,7 @@ impl TcpListener {
 
         let new_fd = unsafe {
             accept(
-                self.fd,
+                self.fd.as_raw_fd(),
                 &mut their_addr as *mut _ as *mut sockaddr,
                 &mut sin_size,
             )
@@ -104,9 +105,11 @@ impl TcpListener {
             return Err(io::Error::last_os_error());
         }
 
-        set_nonblocking(new_fd)?;
+        let fd = unsafe { OwnedFd::from_raw_fd(new_fd) };
 
-        Ok(TcpStream { fd: new_fd })
+        set_nonblocking(fd.as_fd())?;
+
+        Ok(TcpStream { fd })
     }
 
     pub fn local_port(&self) -> io::Result<u16> {
@@ -114,7 +117,7 @@ impl TcpListener {
         let mut addr_len = std::mem::size_of::<sockaddr_storage>() as socklen_t;
 
         let status = unsafe {
-            libc::getsockname(self.fd, &mut addr as *mut _ as *mut sockaddr, &mut addr_len)
+            libc::getsockname(self.fd.as_raw_fd(), &mut addr as *mut _ as *mut sockaddr, &mut addr_len)
         };
 
         if status != 0 {
@@ -133,31 +136,28 @@ impl TcpListener {
             _ => Err(io::Error::other("Unknown address family")),
         }
     }
+}
 
-    // Why use the word "raw" here? We're just returning an i32 ...
-    pub fn as_raw_fd(&self) -> i32 {
-        self.fd
+impl AsFd for TcpListener {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
     }
 }
 
-impl Drop for TcpListener {
-    fn drop(&mut self) {
-        if self.fd != -1 {
-            unsafe {
-                libc::close(self.fd);
-            }
-        }
+impl AsRawFd for TcpListener {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
     }
 }
 
 pub struct TcpStream {
-    fd: i32,
+    fd: OwnedFd,
 }
 
 impl TcpStream {
     pub fn read(&self, buffer: &mut [u8]) -> io::Result<usize> {
         let bytes_received =
-            unsafe { recv(self.fd, buffer.as_mut_ptr() as *mut c_void, buffer.len(), 0) };
+            unsafe { recv(self.fd.as_raw_fd(), buffer.as_mut_ptr() as *mut c_void, buffer.len(), 0) };
 
         if bytes_received < 0 {
             return Err(io::Error::last_os_error());
@@ -170,17 +170,13 @@ impl TcpStream {
     }
 
     pub fn write(&self, bytes: &[u8]) -> io::Result<usize> {
-        let bytes_sent = unsafe { send(self.fd, bytes.as_ptr() as *const c_void, bytes.len(), 0) };
+        let bytes_sent = unsafe { send(self.fd.as_raw_fd(), bytes.as_ptr() as *const c_void, bytes.len(), 0) };
 
         if bytes_sent < 0 {
             Err(io::Error::last_os_error())
         } else {
             Ok(bytes_sent as usize)
         }
-    }
-
-    pub fn as_raw_fd(&self) -> i32 {
-        self.fd
     }
 
     pub fn connect(addr: &str, port: &str) -> io::Result<TcpStream> {
@@ -222,7 +218,8 @@ impl TcpStream {
             }
 
             unsafe { freeaddrinfo(res) };
-            return Ok(TcpStream { fd: sockfd });
+            let fd = unsafe { OwnedFd::from_raw_fd(sockfd) };
+            return Ok(TcpStream { fd });
         }
 
         unsafe { freeaddrinfo(res) };
@@ -234,23 +231,25 @@ impl TcpStream {
     }
 }
 
-impl Drop for TcpStream {
-    fn drop(&mut self) {
-        if self.fd != -1 {
-            unsafe {
-                libc::close(self.fd);
-            }
-        }
+impl AsFd for TcpStream {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
     }
 }
 
-fn set_nonblocking(fd: i32) -> io::Result<()> {
-    let flags = unsafe { fcntl(fd, libc::F_GETFL, 0) };
+impl AsRawFd for TcpStream {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
+fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
+    let flags = unsafe { fcntl(fd.as_raw_fd(), libc::F_GETFL, 0) };
     if flags < 0 {
         return Err(io::Error::last_os_error());
     }
 
-    let result = unsafe { fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    let result = unsafe { fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
     if result < 0 {
         return Err(io::Error::last_os_error());
     }

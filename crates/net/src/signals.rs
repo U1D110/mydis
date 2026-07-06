@@ -1,9 +1,9 @@
-use std::io;
+use std::{io, os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd}};
 
 use libc::{sigaddset, sigemptyset, signalfd, sigprocmask, sigset_t};
 
 pub struct Signals {
-    fd: i32,
+    fd: OwnedFd,
 }
 
 impl Signals {
@@ -25,12 +25,9 @@ impl Signals {
             if fd < 0 {
                 return Err(io::Error::last_os_error());
             }
+            let fd = OwnedFd::from_raw_fd(fd);
             Ok(Signals { fd })
         }
-    }
-
-    pub fn as_raw_fd(&self) -> i32 {
-        self.fd
     }
 
     pub fn drain(&self) -> io::Result<()> {
@@ -38,10 +35,14 @@ impl Signals {
     }
 }
 
-impl Drop for Signals {
-    fn drop(&mut self) {
-        if self.fd != -1 {
-            unsafe { libc::close(self.fd) };
-        }
+impl AsFd for Signals {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
+impl AsRawFd for Signals {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
     }
 }

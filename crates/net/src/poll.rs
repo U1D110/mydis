@@ -1,17 +1,17 @@
-use libc::{EFD_CLOEXEC, EFD_NONBLOCK, c_void, close, epoll_create1, epoll_ctl, epoll_event, epoll_wait};
+use libc::{EFD_CLOEXEC, EFD_NONBLOCK, c_void, epoll_create1, epoll_ctl, epoll_event, epoll_wait};
 
-use std::io;
+use std::{io, os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd}};
 
 pub struct Event {
     flags: u32,
-    fd: i32,
+    fd: RawFd,
 }
 
 impl Event {
     pub fn from_epoll(evt: epoll_event) -> Self {
         Event {
             flags: evt.events,
-            fd: evt.u64 as i32,
+            fd: evt.u64 as RawFd,
         }
     }
 
@@ -35,7 +35,7 @@ impl Event {
         self.flags & libc::EPOLLRDHUP as u32 != 0
     }
 
-    pub fn fd(&self) -> i32 {
+    pub fn fd(&self) -> RawFd {
         self.fd
     }
 }
@@ -78,27 +78,29 @@ impl Interests {
 }
 
 pub struct Poll {
-    epoll_fd: i32,
+    epoll_fd: OwnedFd,
 }
 
 impl Poll {
     pub fn new() -> io::Result<Self> {
-        let epoll_fd = unsafe { epoll_create1(0) };
-        if epoll_fd < 0 {
+        let fd = unsafe { epoll_create1(0) };
+        if fd < 0 {
             return Err(io::Error::last_os_error());
         }
+
+        let epoll_fd = unsafe { OwnedFd::from_raw_fd(fd) };
         Ok(Poll { epoll_fd })
     }
 
-    pub fn register(&self, fd: i32, interests: Interests) -> io::Result<()> {
+    pub fn register(&self, fd: BorrowedFd<'_>, interests: Interests) -> io::Result<()> {
         self.poll_ctl(libc::EPOLL_CTL_ADD, fd, interests)
     }
 
-    pub fn reregister(&self, fd: i32, interests: Interests) -> io::Result<()> {
+    pub fn reregister(&self, fd: BorrowedFd<'_>, interests: Interests) -> io::Result<()> {
         self.poll_ctl(libc::EPOLL_CTL_MOD, fd, interests)
     }
 
-    fn poll_ctl(&self, op: i32, fd: i32, interests: Interests) -> io::Result<()> {
+    fn poll_ctl(&self, op: i32, fd: BorrowedFd<'_>, interests: Interests) -> io::Result<()> {
         let mut flags = (libc::EPOLLET | libc::EPOLLRDHUP) as u32;
         if interests.read {
             flags |= libc::EPOLLIN as u32;
@@ -109,10 +111,10 @@ impl Poll {
 
         let mut event = epoll_event {
             events: flags,
-            u64: fd as u64,
+            u64: fd.as_raw_fd() as u64,
         };
 
-        let res = unsafe { epoll_ctl(self.epoll_fd, op, fd, &mut event) };
+        let res = unsafe { epoll_ctl(self.epoll_fd.as_raw_fd(), op, fd.as_raw_fd(), &mut event) };
 
         if res < 0 {
             return Err(io::Error::last_os_error());
@@ -126,7 +128,7 @@ impl Poll {
 
         let num_events = unsafe {
             epoll_wait(
-                self.epoll_fd,
+                self.epoll_fd.as_raw_fd(),
                 events.inner.as_mut_ptr(),
                 events.inner.capacity() as i32,
                 timeout,
@@ -152,7 +154,7 @@ impl Poll {
         loop {
             let num_events = unsafe {
                 epoll_wait(
-                    self.epoll_fd,
+                    self.epoll_fd.as_raw_fd(),
                     events.inner.as_mut_ptr(),
                     events.inner.capacity() as i32,
                     -1,
@@ -178,18 +180,10 @@ impl Poll {
     }
 }
 
-impl Drop for Poll {
-    fn drop(&mut self) {
-        if self.epoll_fd != -1 {
-            unsafe { close(self.epoll_fd) };
-        }
-    }
-}
-
 // Copy used by worker thread to signal. Does not own the fd.
 #[derive(Clone, Copy)]
 pub struct Notifier {
-    fd: i32,
+    fd: RawFd,
 }
 
 impl Notifier {
@@ -205,7 +199,7 @@ impl Notifier {
 }
 
 pub struct Wakeup {
-    fd: i32,
+    fd: OwnedFd,
 }
 
 impl Wakeup {
@@ -214,22 +208,19 @@ impl Wakeup {
         if fd < 0 {
             Err(io::Error::last_os_error())
         } else {
+            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
             Ok(Wakeup { fd })
         }
     }
 
-    pub fn as_raw_fd(&self) -> i32 {
-        self.fd
-    }
-
     pub fn notifier(&self) -> Notifier {
-        Notifier { fd: self.fd }
+        Notifier { fd: self.fd.as_raw_fd() }
     }
 
     pub fn drain(&self) -> io::Result<()> {
         loop {
             let mut buf: u64 = 0;
-            let n = unsafe { libc::read(self.fd, &mut buf as *mut _ as *mut c_void, 8) };
+            let n = unsafe { libc::read(self.fd.as_raw_fd(), &mut buf as *mut _ as *mut c_void, 8) };
             match n {
                 8 => return Ok(()),
                 
@@ -250,10 +241,14 @@ impl Wakeup {
     }
 }
 
-impl Drop for Wakeup {
-    fn drop(&mut self) {
-        if self.fd != -1 {
-            unsafe { close(self.fd) };
-        }
+impl AsFd for Wakeup {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
+impl AsRawFd for Wakeup {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
     }
 }

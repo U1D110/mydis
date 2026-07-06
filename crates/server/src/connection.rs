@@ -1,5 +1,5 @@
 use net::TcpStream;
-use std::io;
+use std::{io, os::fd::{AsFd, BorrowedFd}};
 
 const READ_BUF_SIZE: usize = 4096;
 const WRITE_BUF_SIZE: usize = 4096;
@@ -15,20 +15,22 @@ pub struct Connection {
     read_buf: Vec<u8>, // Maybe we use BytesMut from `bytes` crate later on
     write_buf: Vec<u8>,
     pending_flush: Option<Vec<u8>>,
+    generation: u32,
 }
 
 impl Connection {
-    pub fn new(stream: TcpStream) -> Self {
+    pub fn new(stream: TcpStream, generation: u32) -> Self {
         Connection {
             stream,
             read_buf: Vec::with_capacity(READ_BUF_SIZE),
             write_buf: Vec::with_capacity(WRITE_BUF_SIZE),
             pending_flush: None,
+            generation,
         }
     }
 
-    pub fn id(&self) -> i32 {
-        self.stream.as_raw_fd()
+    pub fn generation(&self) -> u32 {
+        self.generation
     }
 
     pub fn is_blocked(&self) -> bool {
@@ -107,5 +109,11 @@ impl Connection {
             }
             Err(err) => Err(err),
         }
+    }
+}
+
+impl AsFd for Connection {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.stream.as_fd()
     }
 }

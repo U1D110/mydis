@@ -1,6 +1,5 @@
 use std::{
-    collections::{HashMap, hash_map::Entry},
-    io,
+    collections::{HashMap, hash_map::Entry}, io, os::fd::{AsFd, AsRawFd, RawFd},
 };
 
 use db::Database;
@@ -11,7 +10,8 @@ use crate::{aof::{Aof, FlushRequest}, connection::{Connection, ConnectionStatus}
 
 pub fn handle_events(
     events: &Events,
-    connections: &mut HashMap<i32, Connection>,
+    connections: &mut HashMap<RawFd, Connection>,
+    next_gen: &mut u32,
     listener: &TcpListener,
     poll: &Poll,
     database: &mut Database,
@@ -25,11 +25,14 @@ pub fn handle_events(
                     Ok(stream) => {
                         println!("Accepted a connection on fd {}", stream.as_raw_fd());
 
-                        poll.register(stream.as_raw_fd(), Interests::read_only())?;
+                        poll.register(stream.as_fd(), Interests::read_only())?;
 
-                        let conn = Connection::new(stream);
+                        let generation = *next_gen;
+                        *next_gen += 1;
 
-                        connections.insert(conn.id(), conn);
+                        let conn = Connection::new(stream, generation);
+
+                        connections.insert(conn.as_fd().as_raw_fd(), conn);
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                         // kernel accept queue is empty, time to wait again
@@ -41,14 +44,20 @@ pub fn handle_events(
                     }
                 }
             }
-        } else if event.fd() == aof.notify_fd() {
+        } else if event.fd() == aof.notify_fd().as_raw_fd() {
             for completion in aof.drain_completions()? {
-                let close = if let Some(connection) = connections.get_mut(&completion.fd) {
-                    match completion.result {
+                let close = if let Some(connection) = connections.get_mut(&completion.fd()) {
+                    if connection.generation() != completion.generation() {
+                        // Even though we have the same `fd` between `Connection` and `Completion`
+                        // their generation does not match, and so this is a re-used file descriptor.
+                        continue;
+                    }
+
+                    match completion.result() {
                         Ok(()) => {
                             connection.resume_after_flush();
-                            let process_says_close = process_commands(connection, database, aof, completion.fd)?;
-                            let flush_says_close = flush(connection, poll, completion.fd)?;
+                            let process_says_close = process_commands(connection, database, aof)?;
+                            let flush_says_close = flush(connection, poll)?;
                             process_says_close || flush_says_close
                         }
                         Err(_) => {
@@ -63,7 +72,7 @@ pub fn handle_events(
                 };
 
                 if close {
-                    connections.remove(&completion.fd);
+                    connections.remove(&completion.fd());
                 }
             }
         } else if let Entry::Occupied(mut entry) = connections.entry(event.fd()) {
@@ -84,7 +93,7 @@ pub fn handle_events(
                         Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                             // Done reading, but connection still active
                             if connection.has_pending_writes() {
-                                poll.reregister(event.fd(), Interests::read_write())?;
+                                poll.reregister(connection.as_fd(), Interests::read_write())?;
                             }
                             break;
                         }
@@ -98,11 +107,11 @@ pub fn handle_events(
 
                 if !connection.is_blocked() {
                     // Parse read buffer into commands
-                    connection_closed |= process_commands(connection, database, aof, event.fd())?;
+                    connection_closed |= process_commands(connection, database, aof)?;
                 }
 
                 // Opportunistic write to save context switch overhead/latency
-                connection_closed |= flush(connection, poll, event.fd())?;
+                connection_closed |= flush(connection, poll)?;
             }
 
             if event.rdhup() {
@@ -115,7 +124,7 @@ pub fn handle_events(
                 // However, choosing to accept this in favor of the simplicity of calling flush
                 // instead of reproducing the same match block with the one difference of not 
                 // calling reregister on WouldBlock.
-                connection_closed |= flush(connection, poll, event.fd())?;
+                connection_closed |= flush(connection, poll)?;
             }
 
             if event.error() || event.hang_up() {
@@ -133,16 +142,16 @@ pub fn handle_events(
     Ok(true)
 }
 
-fn flush(connection: &mut Connection, poll: &Poll, fd: i32) -> io::Result<bool> {
+fn flush(connection: &mut Connection, poll: &Poll) -> io::Result<bool> {
     let close_connection = match connection.pump() {
         // Write buffer drained, switch to read_only
         Ok(()) => {
-            poll.reregister(fd, Interests::read_only())?;
+            poll.reregister(connection.as_fd(), Interests::read_only())?;
             false
         }
         // OS send buffer full, bytes still waiting in write buffer
         Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-            poll.reregister(fd, Interests::read_write())?;
+            poll.reregister(connection.as_fd(), Interests::read_write())?;
             false
         }
         Err(err) => {
@@ -158,7 +167,6 @@ fn process_commands(
     connection: &mut Connection,
     database: &mut Database,
     aof: &Aof,
-    fd: i32,
 ) -> io::Result<bool> {
     loop {
         match protocol::parse(connection.read_buf()) {
@@ -174,7 +182,13 @@ fn process_commands(
                     // (until the Aof worker signals it is finished).
                     Some(command_to_persist) => {
                         let bytes = command_to_persist.to_resp_bytes();
-                        aof.submit(FlushRequest { fd, bytes })?;
+                        aof.submit(
+                            FlushRequest::new(
+                                    connection.as_fd().as_raw_fd(),
+                                    bytes,
+                                    connection.generation()
+                                )
+                            )?;
                         connection.block_on_flush(response_bytes);
                         break;
                     }

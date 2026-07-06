@@ -1,5 +1,5 @@
 use net::{Events, Interests, TcpListener, TcpStream};
-use std::io;
+use std::{io, os::fd::AsFd};
 
 #[test]
 fn tcp_listener_accepts_and_echoes() -> io::Result<()> {
@@ -7,7 +7,7 @@ fn tcp_listener_accepts_and_echoes() -> io::Result<()> {
     let port = listener.local_port()?;
 
     let poll = net::Poll::new()?;
-    poll.register(listener.as_raw_fd(), Interests::read_only())?;
+    poll.register(listener.as_fd(), Interests::read_only())?;
 
     let handle = std::thread::spawn(move || {
         let client = TcpStream::connect("127.0.0.1", &port.to_string())
@@ -46,7 +46,7 @@ fn tcp_listener_accepts_and_echoes() -> io::Result<()> {
             1,
             "Expected exactly one event on accept {i}"
         );
-        poll.register(stream.as_raw_fd(), Interests::read_only())?;
+        poll.register(stream.as_fd(), Interests::read_only())?;
 
         // Wait for client to write
         poll.wait(&mut events, -1)?;

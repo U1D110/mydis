@@ -1,4 +1,11 @@
-use std::{fs::{File, OpenOptions}, io::{self, Write}, path::Path, sync::mpsc::{Receiver, Sender, channel}, thread::{self, JoinHandle}};
+use std::{
+    fs::{File, OpenOptions},
+    io::{self, Write},
+    os::fd::{AsFd, BorrowedFd, RawFd},
+    path::Path,
+    sync::mpsc::{Receiver, Sender, channel},
+    thread::{self, JoinHandle}
+};
 
 use db::Database;
 use net::{Notifier, Wakeup};
@@ -12,13 +19,43 @@ pub struct Aof {
 }
 
 pub struct FlushRequest {
-    pub fd: i32,
-    pub bytes: Vec<u8>,
+    fd: RawFd,
+    bytes: Vec<u8>,
+    generation: u32,
+}
+
+impl FlushRequest {
+    pub fn new(fd: RawFd, bytes: Vec<u8>, generation: u32) -> FlushRequest {
+        FlushRequest { fd, bytes, generation }
+    }
+
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
 }
 
 pub struct Completion {
-    pub fd: i32,    // the connection whose write finished
-    pub result: io::Result<()>, // did worker succeed (write_all + sync_data)?
+    fd: RawFd,    // the connection whose write finished
+    result: io::Result<()>, // did worker succeed (write_all + sync_data)?
+    generation: u32,
+}
+
+impl Completion {
+    pub fn new(fd: RawFd, result: io::Result<()>, generation: u32) -> Completion {
+        Completion { fd, result, generation }
+    }
+
+    pub fn fd(&self) -> RawFd {
+        self.fd
+    }
+
+    pub fn result(&self) -> &io::Result<()> {
+        &self.result
+    }
+
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
 }
 
 impl Aof {
@@ -69,8 +106,8 @@ impl Aof {
         let _ = worker.join();
     }
 
-    pub fn notify_fd(&self) -> i32 {
-        self.wakeup.as_raw_fd()
+    pub fn notify_fd(&self) -> BorrowedFd<'_> {
+        self.wakeup.as_fd()
     }
 
     pub fn drain_completions(&self) -> io::Result<Vec<Completion>> {
@@ -95,7 +132,7 @@ fn worker_loop(
             .and_then(|_| file.sync_data());
 
         // Let Aof know we completed.
-        let _ = completion_sender.send(Completion { fd: req.fd, result });
+        let _ = completion_sender.send(Completion::new(req.fd, result, req.generation()));
         // Let event loop (epoll) know that we have Completions to process.
         let _ = notifier.notify();
     }
