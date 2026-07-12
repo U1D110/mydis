@@ -1,6 +1,6 @@
 use std::{io, os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd}};
 
-use libc::{sigaddset, sigemptyset, signalfd, sigprocmask, sigset_t};
+use libc::{c_void, sigaddset, sigemptyset, signalfd, sigprocmask, sigset_t};
 
 pub struct Signals {
     fd: OwnedFd,
@@ -31,7 +31,35 @@ impl Signals {
     }
 
     pub fn drain(&self) -> io::Result<()> {
-        todo!()
+        const SIGINFO_SIZE: usize = std::mem::size_of::<libc::signalfd_siginfo>();
+        let mut buf = [0u8; SIGINFO_SIZE];
+
+        loop {
+            let n = unsafe { 
+                libc::read(
+                    self.fd.as_raw_fd(),
+                    &mut buf as *mut _ as *mut c_void, 
+                    SIGINFO_SIZE
+                ) 
+            };
+
+            match n {
+                -1 => {
+                    let e = io::Error::last_os_error();
+                    match e.raw_os_error() {
+                        Some(libc::EINTR) => continue,
+                        Some(libc::EAGAIN) => return Ok(()),
+                        _ => return Err(e),
+                    }
+                }
+
+                n if n as usize == SIGINFO_SIZE => continue,
+
+                _ => {
+                    return Err(io::Error::other("unexpected signalfd read size: {n}"));
+                }
+            }
+        }
     }
 }
 

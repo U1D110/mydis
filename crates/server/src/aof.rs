@@ -45,16 +45,8 @@ impl Completion {
         Completion { fd, result, generation }
     }
 
-    pub fn fd(&self) -> RawFd {
-        self.fd
-    }
-
-    pub fn result(&self) -> &io::Result<()> {
-        &self.result
-    }
-
-    pub fn generation(&self) -> u32 {
-        self.generation
+    pub fn into_parts(self) -> (RawFd, io::Result<()>, u32) {
+        (self.fd, self.result, self.generation)
     }
 }
 

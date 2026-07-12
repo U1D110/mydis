@@ -1,8 +1,32 @@
 use net::TcpStream;
+use runtime::Poll;
 use std::{io, os::fd::{AsFd, BorrowedFd}};
 
 const READ_BUF_SIZE: usize = 4096;
 const WRITE_BUF_SIZE: usize = 4096;
+
+enum FlushState {
+    Pending { response: Vec<u8> },
+    Ready { result: io::Result<()>, response: Vec<u8> },
+}
+
+impl FlushState {
+    pub fn poll(&mut self) -> Poll<io::Result<()>> {
+        match self {
+            FlushState::Pending { .. } => Poll::Pending,
+            FlushState::Ready { result, .. } => {
+                Poll::Ready(std::mem::replace(result, Ok(())))
+            }
+        }
+    }
+
+    pub fn complete(&mut self, result: io::Result<()>) {
+        if let FlushState::Pending { response } = self {
+            let response = std::mem::take(response);
+            *self = FlushState::Ready { result, response };
+        }
+    }
+}
 
 #[derive(PartialEq)]
 pub enum ConnectionStatus {
@@ -14,7 +38,7 @@ pub struct Connection {
     stream: TcpStream,
     read_buf: Vec<u8>, // Maybe we use BytesMut from `bytes` crate later on
     write_buf: Vec<u8>,
-    pending_flush: Option<Vec<u8>>,
+    flush: Option<FlushState>,
     generation: u32,
 }
 
@@ -24,7 +48,7 @@ impl Connection {
             stream,
             read_buf: Vec::with_capacity(READ_BUF_SIZE),
             write_buf: Vec::with_capacity(WRITE_BUF_SIZE),
-            pending_flush: None,
+            flush: None,
             generation,
         }
     }
@@ -34,7 +58,7 @@ impl Connection {
     }
 
     pub fn is_blocked(&self) -> bool {
-        self.pending_flush.is_some()
+        self.flush.is_some()
     }
 
     pub fn has_pending_writes(&self) -> bool {
@@ -45,18 +69,34 @@ impl Connection {
         &self.read_buf
     }
 
-    pub fn block_on_flush(&mut self, bytes: Vec<u8>) {
-        self.pending_flush = Some(bytes);
-    }
-
-    pub fn resume_after_flush(&mut self) {
-        if let Some(bytes) = self.pending_flush.take() {
-            self.queue_bytes(&bytes);
+    pub fn poll_flush(&mut self) -> Poll<io::Result<()>> {
+        match self.flush.as_mut() {
+            Some(state) => match state.poll() {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(result) => {
+                    if let Some(FlushState::Ready { response, ..}) = self.flush.take() {
+                        if result.is_ok() {
+                            // resume: send the reply we've been holding on to.
+                            self.queue_bytes(&response); 
+                        }
+                        // Err: response dropped after we exit current scope because we just took ownership
+                        //      of the FlushState in flush. (never ack a lost write)
+                    }
+                    Poll::Ready(result)
+                }
+            },
+            None => Poll::Ready(Ok(())),
         }
     }
 
-    pub fn discard_pending_flush(&mut self) {
-        self.pending_flush = None
+    pub fn begin_flush(&mut self, response: Vec<u8>) {
+        self.flush = Some(FlushState::Pending { response });
+    }
+
+    pub fn complete_flush(&mut self, result: io::Result<()>) {
+        if let Some(state) = self.flush.as_mut() {
+            state.complete(result);
+        }
     }
 
     pub fn drain_read_bytes(&mut self, num_bytes: usize) {

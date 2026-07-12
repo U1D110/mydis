@@ -46,25 +46,25 @@ pub fn handle_events(
             }
         } else if event.fd() == aof.notify_fd().as_raw_fd() {
             for completion in aof.drain_completions()? {
-                let close = if let Some(connection) = connections.get_mut(&completion.fd()) {
-                    if connection.generation() != completion.generation() {
+                let (fd, result, generation) = completion.into_parts();
+
+                let close = if let Some(connection) = connections.get_mut(&fd) {
+                    if connection.generation() != generation {
                         // Even though we have the same `fd` between `Connection` and `Completion`
                         // their generation does not match, and so this is a re-used file descriptor.
                         continue;
                     }
 
-                    match completion.result() {
-                        Ok(()) => {
-                            connection.resume_after_flush();
+                    connection.complete_flush(result);
+
+                    match connection.poll_flush() {
+                        runtime::Poll::Ready(Ok(())) => {
                             let process_says_close = process_commands(connection, database, aof)?;
                             let flush_says_close = flush(connection, poll)?;
                             process_says_close || flush_says_close
                         }
-                        Err(_) => {
-                            // Discard pending flush because we never want to acknowledge a lost write
-                            connection.discard_pending_flush();
-                            true
-                        }
+                        runtime::Poll::Ready(Err(_)) => true,
+                        runtime::Poll::Pending => false,
                     }
                 } else {
                     // client already disconnected, write is still durable so nothing to resume.
@@ -72,7 +72,7 @@ pub fn handle_events(
                 };
 
                 if close {
-                    connections.remove(&completion.fd());
+                    connections.remove(&fd);
                 }
             }
         } else if let Entry::Occupied(mut entry) = connections.entry(event.fd()) {
@@ -135,6 +135,7 @@ pub fn handle_events(
                 entry.remove();
             }
         } else if event.fd() == signals.as_raw_fd() {
+            signals.drain()?;
             return Ok(false);
         }
     }
@@ -181,15 +182,15 @@ fn process_commands(
                     // response bytes in the connection until it is no longer blocked
                     // (until the Aof worker signals it is finished).
                     Some(command_to_persist) => {
-                        let bytes = command_to_persist.to_resp_bytes();
+                        let command_as_bytes = command_to_persist.to_resp_bytes();
                         aof.submit(
                             FlushRequest::new(
                                     connection.as_fd().as_raw_fd(),
-                                    bytes,
+                                    command_as_bytes,
                                     connection.generation()
                                 )
                             )?;
-                        connection.block_on_flush(response_bytes);
+                        connection.begin_flush(response_bytes);
                         break;
                     }
 
