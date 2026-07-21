@@ -105,13 +105,6 @@ cargo test
 
 # Run tests for a single crate
 cargo test -p db
-
-# Run with logs visible (gated behind RUST_LOG)
-RUST_LOG=debug cargo run --bin server
-
-# Format and lint (the bar is -D warnings)
-cargo fmt
-cargo clippy --all-targets -- -D warnings
 ```
 
 ## Workspace layout
@@ -146,5 +139,4 @@ pass:
 The dependency list is deliberately minimal. `libc` is used directly for
 `epoll`/`eventfd`/`signalfd` rather than via a wrapper like `mio`. RESP and the
 async runtime are written by hand — reaching for an existing crate would defeat
-the purpose. See [CLAUDE.md](CLAUDE.md) for the full contribution and style
-conventions.
+the purpose.
