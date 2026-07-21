@@ -25,8 +25,8 @@ work come first, because they are the point.
 - **Phase 7 (the from-scratch async runtime) is the next milestone** — not yet
   started.
 
-See [docs/REVISED_ROADMAP.md](docs/REVISED_ROADMAP.md) for the full phase plan
-and design rationale.
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the full phase plan and design
+rationale.
 
 ## Quick start
 

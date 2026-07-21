@@ -4,7 +4,7 @@ In-memory key-value server built from scratch in Rust. Two learning goals:
 Low-level network programming (epoll, non-blocking I/O, stream-oriented protocols)
 Building an asynchronous runtime from scratch
 
-Read docs/REVISED_ROADMAP.md before suggesting architectural changes or new features, and refer back to docs/ROADMAP.md if needed to clarify anything in it. It contains the phase plan, and current state.
+Read docs/ROADMAP.md before suggesting architectural changes or new features. It contains the phase plan and current state.
 
 Build & Test
 bash# Build the workspace (debug)

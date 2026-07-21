@@ -1,199 +1,254 @@
-# Project Roadmap: In-Memory Key-Value Server
+# Project Roadmap — In-Memory Key-Value Server
 
 ## Project Goals
 
-This project has two explicit learning objectives:
+Two learning objectives are the **spine** of this project and the reason it
+exists:
 
-1. **Low-level network programming** — understanding sockets, epoll, non-blocking I/O, stream-oriented protocol correctness, and the realities of TCP fragmentation.
-2. **Building an asynchronous runtime from scratch** — understanding futures, wakers, executors, reactors, and cooperative scheduling by constructing them rather than consuming them.
+1. **Low-level network programming** — sockets, epoll, non-blocking I/O,
+   stream-oriented protocol correctness, TCP fragmentation.
+2. **Building an asynchronous runtime from scratch** — futures, wakers,
+   executors, reactors, cooperative scheduling, constructed rather than consumed.
 
-Redis is used only as a **reference point for the overarching shape of the project** — a known, well-documented in-memory key-value server provides a concrete target. This is **not an attempt to build a feature-complete Redis clone**.
+**Terminus:** once the runtime exists, the server evolves into a **usable
+Redis-like key-value server** with an intentionally limited but growing command
+vocabulary. Redis is a reference point; feature-completeness is an explicit
+*later* destination. Feature breadth is layered on **only after** the runtime
+lands — the networking and runtime phases come first because they are the point.
 
-## Non-Goals (Do Not Suggest)
-
-These would enrich a Redis-clone project but do not serve the stated learning goals. Do not propose adding them:
-
-- Non-string data structures (Lists, Hashes, Sets, Sorted Sets, skip lists)
-- Transactions (MULTI/EXEC)
-- Pub/Sub
-- Memory eviction policies (LRU, LFU, maxmemory)
-- Server introspection commands (INFO)
-- Replication (leader/follower)
-- TLS
-- Cluster mode / sharding
-
-If a design decision could be made simpler by ignoring one of these, ignore it.
+**Nothing is permanently excluded.** Data structures, transactions, pub/sub,
+eviction, INFO, replication, TLS, and cluster are sequenced as **deferred future
+phases** (Phase 9+), ordered by dependency and by how much each stresses the
+runtime.
 
 ## Guiding Principle
 
-Each phase should leave behind a concrete problem that the next phase solves. By the time the async runtime is being designed, the developer should already be tired of managing per-connection suspended state by hand. The runtime should feel *inevitable*, not arbitrary.
+Each phase leaves behind a concrete problem the next phase solves; by the time
+the runtime is designed, managing per-connection suspended state by hand should
+feel painful enough that the runtime is *inevitable*. Once the runtime exists,
+each new command family or data type becomes a new kind of task or storage
+concern that exercises the runtime and re-tests the parser/DB separation.
+
+## Architectural Invariants
+
+- **Parser/DB separation is sacred.** Parser knows no command semantics; DB knows
+  no bytes/framing; the server wires them.
+- **Structured responses, not pre-serialized bytes.** Handlers return `Response`;
+  the protocol layer serializes.
+- **Buffers have single responsibilities.** `read_buf` = unread protocol bytes;
+  `write_buf` = pending outbound bytes.
+- **Single-threaded runtime.** The Phase 7 runtime is single-threaded. The only
+  thread today is the Phase 6 fsync worker. Features that would force revisiting
+  this (replication, cluster) are deliberately the far horizon.
 
 ---
 
-## Current State (Completed Phases)
+## Current State
 
 ### Phase 0 — Foundation ✅
-- Non-blocking TCP sockets
-- epoll event loop
-- Connection lifecycle management
+Non-blocking TCP sockets, epoll event loop, connection lifecycle.
 
 ### Phase 1 — Incremental Parsing ✅
-- Persistent read buffers
-- Incremental parsing with framing
-- Command extraction handling partial reads and batched commands
+Persistent read buffers, incremental framing, partial/batched command extraction.
 
 ### Phase 2 — Real Database ✅
-- Command dispatch (GET/SET/DEL)
-- Shared in-memory state across connections
-- Semantic error responses
-- Clean separation: parser does not know command semantics; DB does not know bytes/framing
-- Stable writable-event handling and partial-write correctness
-- Correct connection cleanup (FD deregistration, buffer drop)
+GET/SET/DEL dispatch, shared state, semantic errors, parser/DB separation,
+partial-write correctness, connection cleanup.
 
 ### Phase 3 — RESP Protocol ✅
-- Length-prefixed, binary-safe framing
-- Incremental RESP parser as state machine
-- Compatible with `redis-cli`
+Length-prefixed binary-safe framing, incremental RESP state machine,
+`redis-cli`-compatible.
 
 ### Phase 4 — Pipelining ✅
-- Multiple in-flight requests without waiting for responses
-- Output buffering and queue management
+Multiple in-flight requests, output buffering and queue management.
+
+### Phase 5 — Expiration and Timers ✅
+Time as a first-class event source alongside I/O readiness.
+
+- [x] Sorted structure drives timeout (`BTreeSet<(u64, String)>`, not a scan)
+- [x] Purge pass touches only expired entries
+- [x] Lazy expiry on read paths (GET/TTL/PTTL/PERSIST/DEL)
+- [x] `SET` resets/clears expiry on an already-expiring key
+- [x] `EXPIRE` / `PEXPIRE` / `EXPIREAT` / `PEXPIREAT`
+- [x] `PERSIST`, `TTL`, `PTTL`
+- [x] Dangling-entry handling
+- **Data structure:** `BTreeSet` with direct removal (not `BinaryHeap` +
+  tombstones) — removal is O(log n) and exact, so tombstones are unnecessary at
+  this scale.
+
+### Cross-cutting hardening — LANDED
+- **`std::os::fd` adoption (complete).** Owning types (`Poll`, `Wakeup`,
+  `TcpListener`, `TcpStream`, `Signals`) hold `OwnedFd` — manual `Drop` impls and
+  `-1` sentinels removed; `AsFd`/`AsRawFd` implemented (incl. `Connection`);
+  `Poll::register`/`reregister` and `set_nonblocking` take `BorrowedFd`;
+  identifier fds are `RawFd`; `Notifier` stays a non-owning `RawFd` (cross-thread
+  correctness governed by the shutdown ordering in `Aof::shutdown`).
 
 ---
 
-## Phase 5 — Expiration and Timers 
+## Phase 6 — Persistence as a Motivating Problem (CURRENT — nearly complete)
 
-### Conceptual Significance
+Purpose: force the first operation that cannot complete synchronously within one
+event-loop iteration — the conceptual seed of the runtime.
 
-This phase introduces **time as a first-class event source** alongside I/O readiness. The event loop now serves two kinds of wakeups: file descriptor readiness and deadline expiration. This duality directly foreshadows the runtime's need to manage both I/O futures and timer futures. Do not rush past this conceptually.
+### Status
 
-### Design Decisions Already Made
+- [x] Synchronous AOF works; latency cost measured and observed
+- [x] Background flush thread handles `fsync`
+- [x] Cross-thread signaling via `eventfd`
+- [x] Crash recovery: AOF replay reconstructs the keyspace
+  - AOF **normalizes** commands to deterministic absolute forms before writing
+    (relative `EXPIRE` → `PEXPIREAT`, `SET ... EX` → `SET ... PXAT`) so replay is
+    time-independent.
+- [x] **Suspended client state correctly resumed after flush completes** —
+  resume mechanism (`resume_after_flush`) plus the **generation-counter guard**
+  that closes the fd-reuse hazard: the eventfd drain validates
+  `connection.generation() == completion.generation()` and skips stale
+  completions for recycled fds.
+- [ ] **No data loss on graceful shutdown** — `Aof::shutdown()` drains and joins
+  the worker, but [`Signals::drain`](crates/net/src/signals.rs) is `todo!()`, so
+  the SIGINT/SIGTERM → `aof.shutdown()` path is unimplemented/unverified.
 
-- **Active expiry**: event loop dynamically computes the `epoll_wait` timeout based on the next expiring key, then runs a purge pass after handling events.
-- **Data structure**: `BinaryHeap<Reverse<(Instant, Key)>>` or `BTreeMap<Instant, Key>` for O(1) deadline peek and efficient range-based purge. A **full timer wheel is unnecessary at this scale** — timer wheels are for kernel-level use cases with millions of concurrent timers.
-- **Lazy expiry**: in addition to the active purge loop, every read operation (GET, EXISTS, TTL, etc.) checks expiry and treats expired keys as absent. This closes the gap between a key's logical expiry time and the next `epoll_wait` wakeup.
-- **Tombstones over eager cleanup**: if a key is explicitly deleted while it has a pending expiry entry in the heap/map, leave the heap entry in place. When the purge pass encounters a heap entry pointing to a key that no longer exists (or has a different expiry), it is simply skipped. This avoids the complexity of removing arbitrary entries from a heap.
+### Implementation notes
 
-### Phase 5 Completion Checklist
+- **fd-reuse correlation fix (generation counter).** Implemented as `u32`:
+  `Connection.generation` assigned at accept (threaded as `next_gen: &mut u32`
+  from `main`), carried on `FlushRequest`/`Completion`, validated in the drain
+  loop. Monotonic ⇒ no ABA; a recycled fd's new connection always differs.
+  (`generation`, not `gen` — `gen` is reserved in edition 2024.)
 
-- [ ] Heap or sorted map drives timeout calculation (not a full keyspace scan)
-- [ ] Purge pass only touches expired entries (not all keys)
-- [ ] Lazy expiry on all read paths
-- [ ] `SET` on an already-expiring key correctly resets or clears its expiry
-- [ ] `EXPIRE` (set TTL in seconds on existing key)
-- [ ] `PEXPIRE` (set TTL in milliseconds)
-- [ ] `EXPIREAT` (set absolute deadline in seconds since epoch)
-- [ ] `PEXPIREAT` (set absolute deadline in milliseconds)
-- [ ] `PERSIST` (strip expiry from a key)
-- [ ] `TTL` (query remaining lifetime in seconds)
-- [ ] `PTTL` (query remaining lifetime in milliseconds)
-- [ ] Dangling heap entries on `DEL` handled correctly via tombstone check on purge
+### Remaining work
 
----
+- **Graceful shutdown.** Implement `Signals::drain`, wire the signalfd branch to
+  reach `aof.shutdown()` cleanly, and verify no queued writes are lost.
 
-## Phase 6 — Persistence as a Motivating Problem (CURRENT)
+### Completion transport
 
-### Purpose
-
-The purpose of this phase is **not** to implement durable storage for its own sake. The purpose is to force a specific experience: the first operation in the project that cannot complete synchronously within a single event loop iteration. This experience is the conceptual seed for the entire async runtime.
-
-### Implementation Sequence
-
-**Step 1 — Naive synchronous AOF.** On every write command, append the command to an append-only file (AOF) and call `fsync` before responding to the client. Measure the latency impact. Every client stalls while the disk catches up. This is the event loop's fundamental weakness made visceral. **Do not skip this step** — feeling the pain matters.
-
-**Step 2 — Background flush thread.** Move the `fsync` to a dedicated background thread. The event loop now has a new problem: how does it know when the flush is done so it can send the client's response?
-
-**Step 3 — Cross-thread signaling via eventfd/pipe.** The natural answer is for the background thread to write a byte to a `pipe` or `eventfd` when the flush completes. The read end is registered with epoll. When epoll wakes up on that descriptor, the event loop reads the result and resumes the suspended client.
-
-### The Realization
-
-After implementing step 3, stop and observe what has been built:
-
-- Something that *starts* work and cannot *immediately* complete it — this is a **Future**.
-- The byte written to the pipe on completion, causing epoll to wake the loop and resume — this is a **Waker**.
-- The event loop deciding what to do next when work is ready — this is an **Executor**.
-
-All three runtime concepts have been reinvented manually, without the vocabulary. This is the point of the phase.
-
-### Phase 6 Completion Criteria
-
-- [X] Synchronous AOF works and its latency cost has been measured and observed
-- [X] Background flush thread handles `fsync`
-- [X] Cross-thread signaling via `eventfd` (preferred on Linux) or `pipe`
-- [ ] Suspended client state correctly resumed after flush completes
-- [ ] No data loss on graceful shutdown
-- [X] Crash recovery: replaying AOF on startup reconstructs the keyspace correctly
+The design uses a **centralized** shared `Receiver<Completion>` in `Aof` plus a
+single `eventfd`, dispatching completions to connections by fd (validated by
+generation). It already has the reactor/waker shape Phase 7 formalizes.
 
 ---
 
 ## Phase 6.5 — Make the Implicit Explicit
 
-A short bridging phase. Take the suspended-flush state from Phase 6 and model it formally:
+**Status: partially started.** A `FlushState` enum is already drafted in
+[connection.rs](crates/server/src/connection.rs) —
 
 ```rust
 enum FlushState {
-    Pending(Receiver<io::Result<()>>),
-    Complete(io::Result<()>),
+    Pending { generation: u64, response: Vec<u8> },
+    Ready(io::Result<()>),
 }
 ```
 
-Write a `poll` method on it. Return values analogous to `Poll::Pending` and `Poll::Ready`. Call it from the event loop.
+— but it is **not yet wired in**: the connection still runs on
+`pending_flush: Option<Vec<u8>>` with `block_on_flush`/`resume_after_flush`/
+`discard_pending_flush`. The remaining work formalizes the suspended-flush state
+on top of the centralized transport:
 
-The realization: this is `std::future::Future` without the vocabulary. The phase should take at most a day. The point is to arrive at the formal interface deliberately, not to be handed it.
+- Introduce a `Poll<T>` enum (`Ready(T)` / `Pending`) mirroring
+  `std::task::Poll`, rediscovered deliberately.
+- Put `poll(&mut self) -> Poll<io::Result<()>>` on **`FlushState`** (the
+  "future"); give `Connection` a `flush: Option<FlushState>` field and a thin
+  `poll_flush` driver (the "task"), replacing `pending_flush` and the three
+  block/resume/discard methods.
+- **Reactor step:** the eventfd drain (after the generation check) delivers the
+  worker's result via `FlushState::complete(result)` (`Pending → Ready`).
+- **Executor step:** the loop calls `connection.poll_flush()`; on
+  `Ready(Ok(()))` it queues the response, resumes command processing, and
+  flushes; on `Ready(Err(_))` it discards and closes.
+- **Reconcile the generation type:** the draft's `Pending { generation: u64 }`
+  disagrees with the live `u32` generation used everywhere else — unify on one.
 
-This phase also exposes a real architectural problem: the current event loop has no principled way to track which pending computations belong to which client connections, or to drive multiple of them concurrently. That gap is precisely what the executor fills in Phase 7.
+The realization: this is `std::future::Future` without the vocabulary, and the
+`complete`/`poll` split rehearses the reactor-delivers / executor-polls
+separation that Phase 7 makes real. The back-to-back call looks like ceremony at
+one connection — that is expected; the payoff is the *shape*. It also exposes the
+gap the executor fills in Phase 7: no principled way to track/drive many pending
+computations concurrently.
 
 ---
 
 ## Phase 7 — Build the Runtime
 
-Formalize what was built organically. Before writing code, spend a day reading the actual signatures of `std::future::Future`, `std::task::Waker`, `std::task::Context`, `std::task::RawWaker`, and `std::task::RawWakerVTable`. Understanding the real ABI before building means designing toward it rather than producing something that has to be discarded.
+Formalize what was built organically. Read the real signatures of
+`std::future::Future`, `std::task::{Waker, Context, RawWaker, RawWakerVTable}`
+before writing code.
 
-### Components
+- **Reactor:** the existing epoll loop, reframed to call wakers for tasks that
+  registered interest.
+- **Waker:** formalize the eventfd trick into a proper `Waker` backed by
+  `RawWaker`/`RawWakerVTable`.
+- **Executor:** a queue of ready tasks; `Poll::Pending` tasks arrange re-enqueue
+  via their waker.
+- **Task:** a boxed `Future` + `Waker`; each connection becomes a task. The
+  `FlushState`/`generation` work from 6.5 feeds directly in.
 
-- **Reactor**: the existing epoll loop. Its job becomes watching OS events and calling wakers for tasks that registered interest in those events. Not new code so much as a reframing of existing code.
-- **Waker**: formalize the `eventfd`/`pipe` trick into a proper `Waker` type backed by `RawWaker` and `RawWakerVTable`. This is gnarly Rust; the concrete experience from Phase 6 maps directly onto the formal interface.
-- **Executor**: a queue of tasks ready to be polled. Tasks that return `Poll::Pending` leave themselves off the queue and arrange (via their waker) to be re-enqueued when progress is possible. This is the cooperative scheduling mechanism.
-- **Task**: a boxed `Future` paired with a `Waker`. Each client connection becomes a task.
+**Constraint:** single-threaded. No work-stealing, no `Send` bounds.
 
-### Constraint
-
-Build a **single-threaded** runtime. Do not introduce work-stealing, `Send` bounds, or multi-threaded executors. A correct single-threaded runtime is the foundation; multi-threading is a possible future extension, not part of this phase.
-
-### Phase 7 Completion Criteria
-
-- [ ] `Future`, `Waker`, `Context` implementations compatible with `std::task` types
-- [ ] Executor that drives multiple tasks concurrently
-- [ ] Reactor integrated with executor: epoll events translate to waker invocations
-- [ ] Timer futures (from Phase 5's deadline tracking) integrated as a wakeup source
-- [ ] Simple smoke test: spawn N async tasks, observe correct concurrent progress
+- [ ] `Future`/`Waker`/`Context` compatible with `std::task`
+- [ ] Executor drives multiple tasks concurrently
+- [ ] Reactor integrated: epoll events → waker invocations
+- [ ] Timer futures (from Phase 5 deadlines) as a wakeup source
+- [ ] Smoke test: spawn N tasks, observe concurrent progress
 
 ---
 
 ## Phase 8 — Consume the Runtime
 
-Rewrite the server on top of the runtime built in Phase 7.
+Rewrite the server on the runtime. Each connection becomes an `async fn`; the
+flush becomes an `async` operation; timer expiry becomes a timer future; the top
+loop becomes `executor.run()`. The payoff is the rough edges.
 
-- Each client connection becomes a task: an `async fn` that reads requests, dispatches commands, and writes responses.
-- The persistence flush becomes an `async` operation.
-- Timer expiry becomes a timer future.
-- The top-level event loop becomes a single call to `executor.run()`.
-
-The educational payoff of this phase is in the **rough edges**. Places where the runtime feels awkward are places where production runtimes (Tokio, async-std, smol) made non-obvious design decisions. Those decisions can now be understood from first principles.
-
-### Phase 8 Completion Criteria
-
-- [ ] Connection handling rewritten as `async fn`
-- [ ] Persistence flush exposed as an `async` operation, awaited from the command handler
-- [ ] Timer expiry handled via timer futures
-- [ ] All previous functionality (RESP, pipelining, expiry, persistence) preserved
-- [ ] A written reflection on which design decisions in the runtime felt awkward and why
+- [ ] Connection handling as `async fn`
+- [ ] Persistence flush as an awaited `async` operation
+- [ ] Timer expiry via timer futures
+- [ ] All prior functionality preserved (RESP, pipelining, expiry, persistence)
+- [ ] Written reflection on which runtime decisions felt awkward and why
 
 ---
 
-## Style & Architecture Notes
+## Product Phases — Flesh Out the KV Server (built on the runtime)
 
-- **Parser/DB separation is sacred.** The parser does not know command semantics. The DB does not know bytes or framing. This separation was established in Phase 2 and should be preserved through every subsequent phase.
-- **Structured responses, not pre-serialized bytes.** Command handlers return structured `Response` values. The protocol layer serializes. Do not regress on this.
-- **Buffers have single responsibilities.** `read_buf` holds unread protocol bytes only. `write_buf` holds pending outbound bytes only. No scratch semantics.
-- **Single-threaded until proven otherwise.** The async runtime in Phase 7 is single-threaded. Multi-threading is out of scope unless explicitly added later.
+These phases are **deferred, not excluded**. Each builds on the finished runtime
+and must preserve the architectural invariants (parser/DB separation, structured
+responses, single-threaded). Ordering is by dependency and runtime stress.
+
+### Phase 9 — String & Keyspace command completeness
+The "limited vocabulary" fleshed out first, staying within the current string
+value model.
+- Strings: `EXISTS`, `INCR`/`DECR`/`INCRBY`/`DECRBY`, `APPEND`, `STRLEN`,
+  `GETSET`, `SETNX`, `GETDEL`, `MGET`/`MSET`/`MSETNX`, `GETRANGE`/`SETRANGE`
+- Keyspace: `KEYS`, `SCAN` (cursor), `TYPE`, `RENAME`/`RENAMENX`, `RANDOMKEY`,
+  `DBSIZE`, `FLUSHDB`/`FLUSHALL`, `COPY`
+- Server/admin: `ECHO`, minimal `COMMAND`, minimal `CONFIG GET`
+
+### Phase 10 — Additional data structures
+The value type becomes an enum; `TYPE` gains meaning; storage model is stressed.
+- Lists (`LPUSH`/`RPUSH`/`LPOP`/`RPOP`/`LRANGE`/`LLEN`…)
+- Hashes (`HSET`/`HGET`/`HDEL`/`HGETALL`…)
+- Sets (`SADD`/`SREM`/`SMEMBERS`/`SISMEMBER`/`SCARD`…)
+- Sorted Sets (`ZADD`/`ZRANGE`/`ZSCORE`… via `BTreeMap` or skip list)
+
+### Phase 11 — Expanded persistence & durability
+- RDB-style snapshotting; AOF rewrite/compaction; configurable fsync policy
+  (`always`/`everysec`/`no`); `BGSAVE`/`BGREWRITEAOF` as async tasks on the
+  runtime.
+
+### Phase 12 — Transactions
+- `MULTI`/`EXEC`/`DISCARD`/`WATCH` (optimistic locking).
+
+### Phase 13 — Pub/Sub
+- `SUBSCRIBE`/`PUBLISH`/`PSUBSCRIBE`; channel registry; each subscriber a task.
+
+### Phase 14 — Eviction & memory policy
+- `maxmemory`, approximate LRU/LFU via key sampling.
+
+### Phase 15 — Introspection & observability
+- `INFO`, `SLOWLOG`, `MONITOR`, `CLIENT LIST`, latency stats.
+
+### Phase 16 — Multi-node (far horizon; may re-scope the single-threaded rule)
+- Replication (leader/follower), then TLS, then cluster/sharding. These are the
+  features that could force revisiting the single-threaded constraint, so they
+  are deliberately last and will be re-planned when reached.
