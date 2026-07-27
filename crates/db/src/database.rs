@@ -91,6 +91,8 @@ impl<C: Clock> InnerDatabase<C> {
             }
 
             "SET" => {
+                // TODO: Look into KEEPTTL. Verify Redis behavior of `SET key newvalue KEEPTTL` is to update existing
+                //      value while maintaining existing expiration.
                 if args.len() == 2 {
                     CommandResult {
                         response: self.set(&args[0], &args[1]),
@@ -255,7 +257,14 @@ impl<C: Clock> InnerDatabase<C> {
                 };
 
                 let persist = if matches!(response, Response::Integer(1)) {
-                    Some(Command { name, args })
+                    // We convert `PERSIST` to `SET` for recording to our AOF, so that we avoid
+                    // the case where the original expiration for our key has passed by the time
+                    // of repopulation via `Aof:replay` resulting in that key not existing when
+                    // we try to execute `PERSIST` on it. 
+                    let v = self.data.get(&args[0]).unwrap().value.clone();
+                    let mut args = args;
+                    args.push(v);
+                    Some(Command{ name: "SET".to_string(), args })
                 } else {
                     None
                 };
@@ -546,7 +555,7 @@ impl<C: Clock> InnerDatabase<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::{assert_eq, time::Duration};
 
     fn command(name: &str, args: &[&str]) -> Command {
         Command {
@@ -879,5 +888,16 @@ mod tests {
         db.execute(command("SET", &["key", "value", "PX", "50"]));
         db.clock.advance(Duration::from_millis(60));
         assert_eq!(db.next_expiration_timeout(), 0);
+    }
+
+    #[test]
+    fn persist_rewritten_as_set() {
+        let mut db = InnerDatabase::for_test();
+        db.execute(command("SET", &["key", "value", "PX", "100"]));
+        let cmd_result = db.execute(command("PERSIST", &["key"]));
+        assert!(cmd_result.persist.is_some());
+        let persist = cmd_result.persist.unwrap();
+        assert_eq!(persist.name, "SET");
+        assert_eq!(persist.args, vec!["key", "value"]);
     }
 }
