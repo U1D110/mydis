@@ -1,0 +1,267 @@
+use net::{Interests, Wakeup};
+use runtime::{Runner, block_on, yield_now};
+use std::{
+    cell::{Cell, RefCell}, io, os::fd::AsFd, pin::Pin, rc::Rc, task::{Context, Poll, Waker}, thread, time::{Duration, Instant},
+};
+
+#[test]
+fn with_simple_closure() {
+    let result = block_on(async { 40 + 2 });
+    assert_eq!(result, 42);
+}
+
+#[test]
+fn with_trivial_future() {
+    struct UnitFuture;
+    
+    impl Future for UnitFuture {
+        type Output = ();
+    
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Ready(())
+        }
+    }
+
+    let result = block_on(UnitFuture);
+    assert_eq!(result, ());
+}
+
+struct Deadline {
+    when: Instant,
+    poll_count: u32,
+    waker: Option<Waker>,
+}
+
+impl Future for Deadline {
+    type Output = u32;
+
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>
+    ) -> Poll<Self::Output> {
+        let this = self.get_mut();
+
+        this.poll_count += 1;
+
+        if Instant::now() >= this.when {
+            this.waker = None;
+            Poll::Ready(this.poll_count)
+        } else {
+            if this.waker.is_none() {
+                let waker = cx.waker().clone();
+                this.waker = Some(waker.clone());
+                let when = this.when;
+
+                thread::spawn(move || {
+                    let now = Instant::now();
+                    if now < when {
+                        thread::sleep(when - now);
+                    }
+                    waker.wake();
+                });
+            }
+
+            Poll::Pending
+        }
+    }
+}
+
+#[test]
+fn parks_until_woken() {
+    let count = block_on(Deadline {
+        when: Instant::now() + Duration::from_millis(50),
+        poll_count: 0,
+        waker: None,
+    });
+
+    println!("Polled {count} times");
+    assert!(count < 10);
+}
+
+#[test]
+fn context_forwarded() {
+    let deadline = Deadline {
+        when: Instant::now() + Duration::from_millis(50),
+        poll_count: 0,
+        waker: None,
+    };
+
+    let count = block_on(async {
+        deadline.await
+    });
+
+    println!("Polled {count} times");
+    assert!(count < 10);
+}
+
+#[test]
+fn tasks_interleave() -> io::Result<()> {
+    let log: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+    let log_for_a = Rc::clone(&log);
+    let log_for_b = Rc::clone(&log);
+
+    let runner = Runner::new()?;
+
+    runner.spawn(async move {
+        for _ in 0..3 {
+            log_for_a.borrow_mut().push("a");
+            yield_now().await;
+        }
+    });
+
+    runner.spawn(async move {
+        for _ in 0..3 {
+            log_for_b.borrow_mut().push("b");
+            yield_now().await;
+        }
+    });
+
+    runner.run()?;
+
+    assert_eq!(*log.borrow(), ["a", "b", "a", "b", "a", "b"]);
+
+    Ok(())
+}
+
+struct Flipper {
+    value: Rc<Cell<bool>>,
+}
+
+impl Drop for Flipper {
+    fn drop(&mut self) {
+        let old = self.value.get();
+        self.value.set(!old);
+    }
+}
+
+struct KeepsWaker {
+    _flipper: Flipper,
+    waker: Rc<RefCell<Option<Waker>>>,
+}
+
+impl Future for KeepsWaker {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+
+        if this.waker.borrow().is_some() {
+            return Poll::Ready(());
+        }
+                
+        *this.waker.borrow_mut() = Some(cx.waker().clone());
+        cx.waker().wake_by_ref();
+
+        Poll::Pending
+    }
+}
+
+
+#[test]
+fn task_future_dropped() -> io::Result<()> {
+    let switch = Rc::new(Cell::new(false));
+    let flipped_switch = Rc::clone(&switch);
+
+    let waker = Rc::new(RefCell::new(None));
+
+    let runner = Runner::new()?;
+
+    let keeps_waker_fut = KeepsWaker {
+        _flipper: Flipper { value: flipped_switch },
+        waker: Rc::clone(&waker),
+    };
+
+    runner.spawn(keeps_waker_fut);
+
+    runner.run()?;
+
+    assert!(waker.borrow().is_some());
+    assert!(switch.get());
+
+    Ok(())
+}
+
+#[test]
+fn task_awaits_readable() -> io::Result<()> {
+    let log: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+    let log_for_a = Rc::clone(&log);
+    let log_for_b = Rc::clone(&log);
+
+    let runner = Runner::new()?;
+    let reactor = runner.reactor();
+
+    let wakeup = Wakeup::new()?;
+    let notifier = wakeup.notifier();
+    let registered = reactor.register(wakeup.as_fd(), Interests::read_only())?;
+
+    runner.spawn(async move {
+        registered.readable().await;
+        log_for_a.borrow_mut().push("readable");
+    });
+
+    runner.spawn(async move {
+        yield_now().await;
+        notifier.notify().unwrap();
+        log_for_b.borrow_mut().push("notify");
+    });
+
+    runner.run()?;
+    assert_eq!(*log.borrow(), ["notify", "readable"]);
+
+    Ok(())
+}
+
+#[test]
+fn task_with_no_waker_not_lost() -> io::Result<()> {
+    let log: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+    let log_for_a = Rc::clone(&log);
+
+    let runner = Runner::new()?;
+    let reactor = runner.reactor();
+
+    let wakeup = Wakeup::new()?;
+    let registered = reactor.register(wakeup.as_fd(), Interests::read_only())?;
+    let notifier = wakeup.notifier();
+    notifier.notify().unwrap();
+
+    runner.spawn(async move {
+        yield_now().await;
+        registered.readable().await;
+        log_for_a.borrow_mut().push("readable");
+    });
+
+    runner.run()?;
+    assert_eq!(*log.borrow(), ["readable"]);
+
+    Ok(())
+}
+
+#[test]
+fn sleepers_wake_and_overlap() -> io::Result<()> {
+    let log: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+    let log_for_a = Rc::clone(&log);
+    let log_for_b = Rc::clone(&log);
+
+    let runner = Runner::new()?;
+    let reactor_a = runner.reactor();
+    let reactor_b = runner.reactor();
+
+    runner.spawn(async move {
+        reactor_a.sleep(Duration::from_millis(80)).await;
+        log_for_a.borrow_mut().push("long");
+    });
+
+    runner.spawn(async move {
+        reactor_b.sleep(Duration::from_millis(20)).await;
+        log_for_b.borrow_mut().push("short");
+    });
+
+    let now = Instant::now();
+    runner.run()?;
+    let elapsed = now.elapsed().as_millis();
+
+    assert!(elapsed >= 80 && elapsed < 100);
+    assert_eq!(*log.borrow(), ["short", "long"]);
+
+    Ok(())
+}
