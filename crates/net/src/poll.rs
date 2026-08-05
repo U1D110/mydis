@@ -100,6 +100,25 @@ impl Poll {
         self.poll_ctl(libc::EPOLL_CTL_MOD, fd, interests)
     }
 
+    pub fn deregister(&self, fd: RawFd) -> io::Result<()> {
+        let mut empty_event: epoll_event = unsafe { std::mem::zeroed() };
+
+        let res = unsafe {
+            epoll_ctl(
+                self.epoll_fd.as_raw_fd(),
+                libc::EPOLL_CTL_DEL,
+                fd,
+                &mut empty_event,
+            )
+        };
+
+        if res < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
     fn poll_ctl(&self, op: i32, fd: BorrowedFd<'_>, interests: Interests) -> io::Result<()> {
         let mut flags = (libc::EPOLLET | libc::EPOLLRDHUP) as u32;
         if interests.read {
