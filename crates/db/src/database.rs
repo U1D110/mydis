@@ -55,6 +55,12 @@ impl Database {
     }
 }
 
+impl Default for Database {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 struct InnerDatabase<C: Clock = SystemClock> {
     data: HashMap<String, Entry>,
     // For a production grade project, BinaryHeap would
@@ -324,11 +330,10 @@ impl<C: Clock> InnerDatabase<C> {
     }
 
     fn set(&mut self, key: &str, value: &str) -> Response {
-        if let Some(entry) = self.data.get(key) {
-            if let Some(expiration_ms) = entry.expiration_ms {
+        if let Some(entry) = self.data.get(key) 
+            && let Some(expiration_ms) = entry.expiration_ms {
                 self.expiring_keys.remove(&(expiration_ms, key.to_string()));
             }
-        }
 
         let _ = self.data.insert(
             key.to_string(),
@@ -356,12 +361,11 @@ impl<C: Clock> InnerDatabase<C> {
                 Err(kind) => return Response::Error(kind),
             };
 
-        if let Some(entry) = self.data.get(key) {
-            if let Some(existing_expiration) = entry.expiration_ms {
+        if let Some(entry) = self.data.get(key) 
+            && let Some(existing_expiration) = entry.expiration_ms {
                 self.expiring_keys
                     .remove(&(existing_expiration, key.to_string()));
             }
-        }
 
         let entry = Entry {
             value: value.to_string(),
@@ -445,6 +449,18 @@ impl<C: Clock> InnerDatabase<C> {
             }
         };
 
+        let to_ms = |v: i64, units: ExpirationUnits| -> Result<u64, ErrorKind> {
+            match units {
+                ExpirationUnits::Seconds => {
+                    match (v as u64).checked_mul(1000) {
+                        Some(value) => Ok(value),
+                        None => return Err(ErrorKind::OutOfRange),
+                    }
+                }
+                ExpirationUnits::Milliseconds => Ok(v as u64),
+            }
+        };
+
         match exp_type {
             ExpirationType::Absolute => {
                 let now = match units {
@@ -460,16 +476,7 @@ impl<C: Clock> InnerDatabase<C> {
                     }
                 }
 
-                let new_expiration_ms = match units {
-                    ExpirationUnits::Seconds => {
-                        match (parsed_int as u64).checked_mul(1000) {
-                            Some(value) => value,
-                            None => return Err(ErrorKind::OutOfRange),
-                        }
-                    }
-                    ExpirationUnits::Milliseconds => parsed_int as u64,
-                };
-
+                let new_expiration_ms = to_ms(parsed_int, units)?;
                 Ok(Some(new_expiration_ms))
             }
             ExpirationType::Relative => {
@@ -481,15 +488,7 @@ impl<C: Clock> InnerDatabase<C> {
                     }
                 }
 
-                let new_expiration_ms = match units {
-                    ExpirationUnits::Seconds => {
-                        match (parsed_int as u64).checked_mul(1000) {
-                            Some(value) => value,
-                            None => return Err(ErrorKind::OutOfRange),
-                        }
-                    }
-                    ExpirationUnits::Milliseconds => parsed_int as u64,
-                };
+                let new_expiration_ms = to_ms(parsed_int, units)?;
 
                 let now_ms = clock.now().as_millis() as u64;
                 Ok(Some(now_ms + new_expiration_ms))
@@ -541,14 +540,12 @@ impl<C: Clock> InnerDatabase<C> {
     }
 
     fn remove_if_expired(&mut self, key: &str) {
-        if let Some(entry) = self.data.get(key) {
-            if let Some(expiration_ms) = entry.expiration_ms
-                && (self.clock.now().as_millis() as u64) > expiration_ms
-            {
-                let _ = self.expiring_keys.remove(&(expiration_ms, key.to_string()));
-                let _ = self.data.remove(key);
-            }
-        }
+        if let Some(entry) = self.data.get(key)
+            && let Some(expiration_ms) = entry.expiration_ms
+                && (self.clock.now().as_millis() as u64) > expiration_ms {
+                    let _ = self.expiring_keys.remove(&(expiration_ms, key.to_string()));
+                    let _ = self.data.remove(key);
+                }
     }
 }
 
@@ -762,7 +759,7 @@ mod tests {
         assert!(matches!(response, Response::Integer(1)));
 
         let response = db.execute(command("TTL", &["k"])).response;
-        assert!(matches!(response, Response::Integer(n) if n >= 0 && n < 2));
+        assert!(matches!(response, Response::Integer(n) if (0..2).contains(&n)));
 
         db.clock.advance(Duration::from_secs(1));
         let response = db.execute(command("GET", &["k"])).response;
@@ -833,18 +830,18 @@ mod tests {
         db.execute(command("SET", &["short", "s", "PX", "100"]));
 
         // Verify purge does not remove unexpired keys
-        assert_eq!(true, db.data.contains_key("short"));
+        assert!(db.data.contains_key("short"));
         db.purge_expired_keys();
-        assert_eq!(true, db.data.contains_key("short"));
+        assert!(db.data.contains_key("short"));
 
         // Wait for expiration
         db.clock.advance(Duration::from_millis(110));
 
         // Verify the expired key still lingers, then purge and verify it
         // has been removed.
-        assert_eq!(true, db.data.contains_key("short"));
+        assert!(db.data.contains_key("short"));
         db.purge_expired_keys();
-        assert_eq!(false, db.data.contains_key("short"));
+        assert!(!db.data.contains_key("short"));
     }
 
     #[test]
