@@ -1,4 +1,4 @@
-use net::{Interests, Wakeup};
+use net::{TcpListener, TcpStream, Wakeup};
 use runtime::{Runner, block_on, yield_now};
 use std::{
     cell::{Cell, RefCell}, io, os::fd::AsFd, pin::Pin, rc::Rc, task::{Context, Poll, Waker}, thread, time::{Duration, Instant},
@@ -192,7 +192,7 @@ fn task_awaits_readable() -> io::Result<()> {
 
     let wakeup = Wakeup::new()?;
     let notifier = wakeup.notifier();
-    let registered = reactor.register(wakeup.as_fd(), Interests::read_only())?;
+    let registered = reactor.register(wakeup.as_fd())?;
 
     runner.spawn(async move {
         registered.readable().await;
@@ -220,7 +220,7 @@ fn task_with_no_waker_not_lost() -> io::Result<()> {
     let reactor = runner.reactor();
 
     let wakeup = Wakeup::new()?;
-    let registered = reactor.register(wakeup.as_fd(), Interests::read_only())?;
+    let registered = reactor.register(wakeup.as_fd())?;
     let notifier = wakeup.notifier();
     notifier.notify().unwrap();
 
@@ -262,6 +262,41 @@ fn sleepers_wake_and_overlap() -> io::Result<()> {
 
     assert!(elapsed >= 80 && elapsed < 100);
     assert_eq!(*log.borrow(), ["short", "long"]);
+
+    Ok(())
+}
+
+#[test]
+fn handle_readable_and_writable() -> io::Result<()> {
+    let log: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+    let log_for_rable = Rc::clone(&log);
+    let log_for_wable = Rc::clone(&log);
+
+    let listener = TcpListener::bind("0")?;
+    let port = listener.local_port()?;
+
+    let client = TcpStream::connect("127.0.0.1", &port.to_string())?;
+    let server = listener.accept()?;
+    client.write(b"Greetings and salutations.")?;
+
+    let runner = Runner::new()?;
+    let registered = Rc::new(runner.reactor().register(server.as_fd())?);
+    let reg_r = Rc::clone(&registered);
+    let reg_w = Rc::clone(&registered);
+
+    runner.spawn(async move {
+        reg_r.readable().await;
+        log_for_rable.borrow_mut().push("read");
+    });
+
+    runner.spawn(async move {
+        reg_w.writable().await;
+        log_for_wable.borrow_mut().push("write");
+    });
+
+    runner.run()?;
+
+    assert_eq!(*log.borrow(), ["read", "write"]);
 
     Ok(())
 }

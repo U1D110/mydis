@@ -1,5 +1,5 @@
 use std::{
-    cell::{Cell, RefCell}, collections::{BTreeMap, HashMap, hash_map::Entry}, io, os::fd::{AsRawFd, BorrowedFd, RawFd}, pin::Pin, rc::Rc, task::{Context, Poll, Waker}, time::{Duration, Instant},
+    cell::{Cell, RefCell}, collections::{BTreeMap, HashMap}, io, os::fd::{AsRawFd, BorrowedFd, RawFd}, pin::Pin, rc::Rc, task::{Context, Poll, Waker}, time::{Duration, Instant},
 };
 use net::{Events, Interests, Poll as Epoll};
 
@@ -51,6 +51,19 @@ impl Future for Readable {
     }
 }
 
+pub struct Writable {
+    fd: RawFd,
+    reactor: Rc<Reactor>,
+}
+
+impl Future for Writable {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.reactor.poll_writable(self.fd, cx)
+    }
+}
+
 pub struct Registered {
     fd: RawFd,
     reactor: Rc<Reactor>,
@@ -59,6 +72,10 @@ pub struct Registered {
 impl Registered {
     pub fn readable(&self) -> Readable {
         Readable { fd: self.fd, reactor: Rc::clone(&self.reactor) }
+    }
+
+    pub fn writable(&self) -> Writable {
+        Writable { fd: self.fd, reactor: Rc::clone(&self.reactor) }
     }
 }
 
@@ -70,14 +87,37 @@ impl Drop for Registered {
     }
 }
 
+#[derive(Default)]
+struct Direction {
+    waker: Option<Waker>,
+    ready: bool,
+}
+
+impl Direction {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.ready {
+            self.ready = false;
+            Poll::Ready(())
+        } else {
+            self.waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    fn signal(&mut self) -> Option<Waker> {
+        self.ready = true;
+        self.waker.take()
+    }
+}
+
 /// Consider that `Registration` has a single `Waker` slot, which means if
 /// two `Tasks`s were to be waiting for readability on the same fd the second
 /// of those would overwrite the first, losing that first `Task`. 
 /// This project is one `Task` per connection, so this is fine.
 #[derive(Default)]
 struct Registration {
-    waker: Option<Waker>,
-    ready: bool,
+    read: Direction,
+    write: Direction,
 }
 
 pub struct Reactor {
@@ -108,8 +148,13 @@ impl Reactor {
         self.sleep_until(Instant::now() + duration)
     }
 
-    pub fn register(self: &Rc<Self>, fd: BorrowedFd<'_>, interests: Interests) -> io::Result<Registered> {
-        self.epoll.register(fd, interests)?;
+    /// The `fd` will always be registered with both read and write interests. This means
+    /// in cases where you are only concerned with reading, there will still be an initial
+    /// spurious writable event though it will be harmless. Since `net::Poll` uses 
+    /// egde-triggered mode, there will be no further writable events unless the fd actually
+    /// becomes writable.
+    pub fn register(self: &Rc<Self>, fd: BorrowedFd<'_>) -> io::Result<Registered> {
+        self.epoll.register(fd, Interests::read_write())?;
         self.registry.borrow_mut().insert(fd.as_raw_fd(), Registration::default());
         Ok(Registered { fd: fd.as_raw_fd(), reactor: Rc::clone(self) })
     }
@@ -121,19 +166,16 @@ impl Reactor {
     }
 
     pub fn poll_readable(&self, fd: RawFd, cx: &mut Context<'_>) -> Poll<()> {
-        match self.registry.borrow_mut().entry(fd) {
-            Entry::Occupied(mut entry) => {
-                let reg = entry.get_mut();
-                if reg.ready {
-                    reg.ready = false;
-                    Poll::Ready(())
-                } else {
-                    reg.waker = Some(cx.waker().clone());
-                    Poll::Pending
-                }
-            }
+        match self.registry.borrow_mut().get_mut(&fd) {
+            Some(reg) => reg.read.poll(cx),
+            None => panic!("No key in registry matching fd: {fd}"),
+        }
+    }
 
-            Entry::Vacant(_) => panic!("No key in registry matching fd: {fd}"),
+    pub fn poll_writable(&self, fd: RawFd, cx: &mut Context<'_>) -> Poll<()> {
+        match self.registry.borrow_mut().get_mut(&fd) {
+            Some(reg) => reg.write.poll(cx),
+            None => panic!("No key in registry matching fd: {fd}"),
         }
     }
 
@@ -158,18 +200,28 @@ impl Reactor {
         self.epoll.wait(&mut events, timeout)?;
 
         for event in events.iter() {
-            let waker = {
+            let (read_waker, write_waker) = {
                 let mut registry = self.registry.borrow_mut();
                 match registry.get_mut(&event.fd()) {
                     Some(reg) => {
-                        reg.ready = true;
-                        reg.waker.take()
+                        let fatal = event.error() || event.hang_up();
+                        let read = event.readable() || event.rdhup();
+                        let write = event.writable();
+                    
+                        (
+                            if read  || fatal { reg.read.signal()  } else { None },
+                            if write || fatal { reg.write.signal() } else { None }
+                        )
                     }
-                    None => None,
+                    None => (None, None),
                 }
             };
 
-            if let Some(waker) = waker {
+            if let Some(waker) = read_waker {
+                waker.wake();
+            }
+
+            if let Some(waker) = write_waker {
                 waker.wake();
             }
         }
@@ -228,5 +280,20 @@ mod tests {
         assert_eq!(0, reactor.timers.borrow().len());
 
         Ok(())
+    }
+
+    #[test]
+    fn direction_readiness() {
+        let mut direction = Direction::default();
+        let mut cx = Context::from_waker(Waker::noop());
+
+        // Ready before wait
+        assert!(direction.signal().is_none());              // signal ready without stored waker
+        assert!(direction.poll(&mut cx).is_ready());        // confirm ready without needing waker
+
+        // Wait before ready
+        assert!(direction.poll(&mut cx).is_pending());      // now we park and store the waker
+        assert!(direction.signal().is_some());              // signal takes the waker
+        assert!(direction.poll(&mut cx).is_ready());        // confirmation signal set ready
     }
 }
