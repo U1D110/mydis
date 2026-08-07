@@ -300,3 +300,55 @@ fn handle_readable_and_writable() -> io::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn spawner_shuts_down_runner() -> io::Result<()> {
+    let runner = Runner::new()?;
+    let wakeup = Wakeup::new()?;
+    let notifier = wakeup.notifier();
+    let reg = runner.reactor().register(wakeup.as_fd())?;
+    let wakes = Rc::new(Cell::new(0));
+
+    let ws = Rc::clone(&wakes);
+    runner.spawn(async move {
+        loop {
+            reg.readable().await;
+            ws.update(|n| n + 1);
+        }
+    });
+
+    let spawner = runner.spawner();
+    runner.spawn(async move {
+        notifier.notify().unwrap();
+        yield_now().await;
+        spawner.shutdown();
+    });
+
+    runner.run()?;
+
+    assert_eq!(wakes.get(), 1);
+
+    Ok(())
+}
+
+#[test]
+fn spawner_spawns() -> io::Result<()> {
+    let log: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+    let log_a = Rc::clone(&log);
+    let log_b = Rc::clone(&log);
+
+    let runner = Runner::new()?;
+    let spawner = runner.spawner();
+    runner.spawn(async move {
+        log_a.borrow_mut().push("parent");
+        spawner.spawn(async move {
+            log_b.borrow_mut().push("child");
+        });
+    });
+
+    runner.run()?;
+
+    assert_eq!(*log.borrow(), ["parent", "child"]);
+    
+    Ok(())
+}

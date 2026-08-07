@@ -200,9 +200,11 @@ impl Reactor {
         self.epoll.wait(&mut events, timeout)?;
 
         for event in events.iter() {
-            let (read_waker, write_waker) = {
-                let mut registry = self.registry.borrow_mut();
-                match registry.get_mut(&event.fd()) {
+            let (
+                    read_waker, 
+                    write_waker
+                ) = {
+                match self.registry.borrow_mut().get_mut(&event.fd()) {
                     Some(reg) => {
                         let fatal = event.error() || event.hang_up();
                         let read = event.readable() || event.rdhup();
@@ -217,13 +219,8 @@ impl Reactor {
                 }
             };
 
-            if let Some(waker) = read_waker {
-                waker.wake();
-            }
-
-            if let Some(waker) = write_waker {
-                waker.wake();
-            }
+            if let Some(waker) = read_waker  { waker.wake(); }
+            if let Some(waker) = write_waker { waker.wake(); }
         }
 
         // pop entries off the front of timers while their "when" <= Instant::now()

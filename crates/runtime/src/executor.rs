@@ -1,11 +1,19 @@
-use std::cell::Cell;
-use std::io;
-use std::mem::ManuallyDrop;
-use std::pin::pin;
-use std::rc::Rc;
-use std::sync::Arc;
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-use std::thread::{self, Thread};
+use std::{
+    cell::Cell, 
+    io, 
+    mem::ManuallyDrop, 
+    pin::pin, 
+    rc::{Rc, Weak}, 
+    sync::Arc, 
+    task::{
+        Context,
+        Poll,
+        RawWaker,
+        RawWakerVTable,
+        Waker
+    },
+    thread::{self, Thread},
+};
 
 use crate::task::{RunQueue, Task};
 use crate::Reactor;
@@ -68,7 +76,8 @@ where
 pub struct Runner {
     queue: Rc<RunQueue>,
     reactor: Rc<Reactor>,
-    alive_count: Cell<usize>,
+    alive_count: Rc<Cell<usize>>,
+    shutdown: Rc<Cell<bool>>,
 }
 
 impl Runner {
@@ -77,7 +86,8 @@ impl Runner {
         Ok(Self { 
             queue: Rc::new(RunQueue::new()), 
             reactor: Rc::new(reactor),
-            alive_count: Cell::new(0),
+            alive_count: Rc::new(Cell::new(0)),
+            shutdown: Rc::new(Cell::new(false)),
         })
     }
 
@@ -94,6 +104,14 @@ impl Runner {
         self.alive_count.update(|n| n + 1);
     }
 
+    pub fn spawner(&self) -> Spawner {
+        Spawner {
+            queue: Rc::downgrade(&self.queue),
+            alive_count: Rc::clone(&self.alive_count),
+            shutdown: Rc::clone(&self.shutdown),
+        }
+    }
+
     pub fn run(&self) -> io::Result<()> {
         loop {
             for task in self.queue.take() {
@@ -102,7 +120,9 @@ impl Runner {
                 }
             }
 
-            if self.alive_count.get() == 0 { return Ok(()); }
+            if self.shutdown.get() || self.alive_count.get() == 0 { 
+                return Ok(()); 
+            }
 
             // If we have more tasks queued after processing the last batch, use a 0 timeout
             // so as not to block and immediately process the new batch.
@@ -114,6 +134,29 @@ impl Runner {
             };
             self.reactor.turn(timeout)?;
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct Spawner {
+    queue: Weak<RunQueue>,
+    alive_count: Rc<Cell<usize>>,
+    shutdown: Rc<Cell<bool>>,
+}
+
+impl Spawner {
+    pub fn spawn<F>(&self, future: F) 
+    where
+        F: Future<Output = ()> + 'static
+    {
+        let Some(queue) = self.queue.upgrade() else { return };
+        let task = Rc::new(Task::new(future, Rc::downgrade(&queue)));
+        task.schedule();
+        self.alive_count.update(|n| n + 1);
+    }
+
+    pub fn shutdown(&self) {
+        self.shutdown.set(true);
     }
 }
 
