@@ -8,3 +8,6 @@ db = { path = "../db" }
 net = { path = "../net" }
 protocol = { path = "../protocol" }
 runtime = { path = "../runtime" }
+
+[dev-dependencies]
+libc = "*"

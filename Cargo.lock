@@ -45,6 +45,7 @@ name = "server"
 version = "0.1.0"
 dependencies = [
  "db",
+ "libc",
  "net",
  "protocol",
  "runtime",

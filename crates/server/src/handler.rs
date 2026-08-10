@@ -76,9 +76,8 @@ pub fn handle_events(
                 }
             }
         } else if let Entry::Occupied(mut entry) = connections.entry(event.fd()) {
-            let mut connection_closed = false;
-
             let connection = entry.get_mut();
+            let mut connection_closed = false;
 
             if event.readable() {
                 loop {

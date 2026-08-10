@@ -454,7 +454,7 @@ impl<C: Clock> InnerDatabase<C> {
                 ExpirationUnits::Seconds => {
                     match (v as u64).checked_mul(1000) {
                         Some(value) => Ok(value),
-                        None => return Err(ErrorKind::OutOfRange),
+                        None => Err(ErrorKind::OutOfRange),
                     }
                 }
                 ExpirationUnits::Milliseconds => Ok(v as u64),
