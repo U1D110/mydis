@@ -4,6 +4,7 @@ use std::{io, os::fd::{AsFd, BorrowedFd}};
 
 const READ_BUF_SIZE: usize = 4096;
 const WRITE_BUF_SIZE: usize = 4096;
+const MAX_READ_BUF: usize = 64*1024*1024;
 
 enum FlushState {
     Pending { response: Vec<u8> },
@@ -111,13 +112,13 @@ impl Connection {
                     // client disconnected
                     Ok(ConnectionStatus::Closed)
                 } else {
-                    // TODO: Maximum buffer size check
                     self.read_buf.extend_from_slice(&buf[..bytes_read]);
-                    //println!(
-                    //    "read_buf after read: {:?}",
-                    //    String::from_utf8_lossy(&self.read_buf)
-                    //);
-                    Ok(ConnectionStatus::Active)
+
+                    if self.read_buf().len() >= MAX_READ_BUF {
+                        Err(io::Error::other("exceeded query buffer limit"))
+                    } else {
+                        Ok(ConnectionStatus::Active)
+                    }
                 }
             }
             Err(err) => Err(err),

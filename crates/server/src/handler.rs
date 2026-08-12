@@ -163,47 +163,79 @@ fn flush(connection: &mut Connection, poll: &Poll) -> io::Result<bool> {
     Ok(close_connection)
 }
 
+const PERSIST_BATCH_LIMIT: usize = 1024 * 1024;
+
 fn process_commands(
     connection: &mut Connection,
     database: &mut Database,
     aof: &Aof,
 ) -> io::Result<bool> {
+    let mut aof_buf: Vec<u8> = Vec::new();
+    let mut response_buf: Vec<u8> = Vec::new();
+
     loop {
         match protocol::parse(connection.read_buf()) {
             ParseResult::Complete(command, to_consume) => {
                 connection.drain_read_bytes(to_consume);
 
                 let result = database.execute(command);
-                let response_bytes = protocol::serialize(result.response);
+                let mut response_bytes = protocol::serialize(result.response);
 
-                match result.persist {
-                    // Push the bytes we want to persist to Aof, then hold on to our
-                    // response bytes in the connection until it is no longer blocked
-                    // (until the Aof worker signals it is finished).
-                    Some(command_to_persist) => {
-                        let command_as_bytes = command_to_persist.to_resp_bytes();
-                        aof.submit(
-                            FlushRequest::new(
-                                    connection.as_fd().as_raw_fd(),
-                                    command_as_bytes,
-                                    connection.generation()
-                                )
-                            )?;
-                        connection.begin_flush(response_bytes);
-                        break;
-                    }
+                if let Some(command_to_persist) = result.persist {
+                    aof_buf.append(&mut command_to_persist.to_resp_bytes());
+                }
 
-                    // Nothing to persist, so queue response and continue parsing
-                    None => connection.queue_bytes(&response_bytes),
+                if aof_buf.is_empty() {
+                    connection.queue_bytes(&response_bytes)
+                } else {
+                    response_buf.append(&mut response_bytes);
+                }
+
+                if aof_buf.len() >= PERSIST_BATCH_LIMIT {
+                    break;
                 }
             }
             ParseResult::Incomplete => break,
             ParseResult::Error(err) => {
+                // The stream is corrupt, so this connection is closing. Commands already
+                // parsed in this batch have run and mutated the database, so their AOF
+                // bytes must still be persisted -- dropping them would leave the log
+                // disagreeing with the keyspace across a restart.
+                //
+                // We deliberately do not `begin_flush` here, because there is nothing to
+                // resume into. That means `response_buf` is dropped: a client that sent
+                // `SET a`, `SET b`, <garbage> receives only the error and never the two
+                // `+OK`s, even though both writes are durable. Acceptable -- a client that
+                // corrupted its own framing cannot trust the reply stream anyway, and it
+                // matches Redis, which answers a protocol error with an error and a close.
+                //
+                // The completion for this submit arrives after the connection has been
+                // removed, and is discarded by the `else` branch in `handle_events`.
+                if !aof_buf.is_empty() {
+                    aof.submit(
+                        FlushRequest::new(
+                            connection.as_fd().as_raw_fd(), 
+                            aof_buf, 
+                            connection.generation()
+                        )
+                    )?;
+                }
                 let bytes = protocol::serialize(Response::Error(ErrorKind::from(err)));
                 connection.queue_bytes(&bytes);
                 return Ok(true);
             }
         }
+    }
+
+    if !aof_buf.is_empty() {
+        aof.submit(
+            FlushRequest::new(
+                    connection.as_fd().as_raw_fd(),
+                    aof_buf,
+                    connection.generation()
+                )
+            )?;
+        connection.begin_flush(response_buf);
     }
 
     Ok(false)
