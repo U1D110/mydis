@@ -1,27 +1,98 @@
 mod aof;
 mod connection;
-mod handler;
 
-use crate::{aof::Aof, connection::Connection, handler::handle_events};
+use crate::{aof::Aof, connection::handle_connection};
 
-use std::{collections::HashMap, io, os::fd::{AsFd, RawFd}};
+use std::{cell::RefCell, io::self, os::fd::{AsFd, AsRawFd}, rc::Rc, time::Duration};
 
 use db::Database;
-use net::{Events, Interests, Poll, Signals, TcpListener};
+use net::{Signals, TcpListener};
+use runtime::{Reactor, Runner, Spawner};
 
-const EVENT_BUF_SIZE: usize = 1024;
+async fn accept_loop(
+    listener: TcpListener,
+    reactor: Rc<Reactor>,
+    spawner: Spawner,
+    database: Rc<RefCell<Database>>,
+    aof: Rc<Aof>,
+) {
+    let registered = reactor
+        .register(listener.as_fd())
+        .expect("failed to register listener");
+
+    loop {
+        registered.readable().await;
+
+        loop {
+            match listener.accept() {
+                Ok(stream) => {
+                    println!("Accepted a connection on fd {}", stream.as_raw_fd());
+                    spawner.spawn(
+                        handle_connection(
+                            stream,
+                            Rc::clone(&reactor),
+                            Rc::clone(&database),
+                            Rc::clone(&aof),
+                        )
+                    );
+                }
+                
+                // kernel accept queue is empty, time to wait again
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+
+                Err(e) => {
+                    eprintln!("Failed to accept connection: {}", e);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn signal_task(signals: Signals, reactor: Rc<Reactor>, spawner: Spawner) {
+    let registered = reactor.register(signals.as_fd()).expect("failed to register signal handler");
+    registered.readable().await;
+    let _ = signals.drain();
+    spawner.shutdown();
+}
+
+async fn aof_completions(aof: Rc<Aof>, reactor: Rc<Reactor>) {
+    let registered = reactor
+        .register(aof.notify_fd())
+        .expect("failed to register aof");
+
+    loop {
+        registered.readable().await;
+        aof.drain_and_complete().expect("failed to drain completions");
+    }
+}
+
+async fn expiry(database: Rc<RefCell<Database>>, reactor: Rc<Reactor>) {
+    loop {
+        let timeout_ms = database.borrow().next_expiration_timeout();
+
+        let snooze = if timeout_ms < 0 {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_millis(timeout_ms.max(1) as u64)
+        };
+
+        reactor.sleep(snooze).await;
+        database.borrow_mut().purge_expired_keys();
+    }
+}
 
 fn main() -> io::Result<()> {
     let signals = Signals::new()?;
-    let mut database = Database::new();
+    let database = Rc::new(RefCell::new(Database::new()));
 
     // Replay append-only file, if one exists, to repopulate the database. Then open
     // or create the append-only file so we can write to it as we run.
     let aof_path = std::env::var("MYDIS_AOF_PATH")
         .unwrap_or_else(|_| "appendonly.aof".to_string());
 
-    let valid_length = aof::replay(&aof_path, &mut database)?;
-    let mut aof = Aof::open(&aof_path, valid_length)?;
+    let valid_length = aof::replay(&aof_path, Rc::clone(&database))?;
+    let aof = Rc::new(Aof::open(&aof_path, valid_length)?);
 
     // Get our port and create a listener.
     let port = std::env::var("MYDIS_PORT")
@@ -29,39 +100,25 @@ fn main() -> io::Result<()> {
 
     let listener = TcpListener::bind(&port)?;
 
-    // Create our `net::Poll` and register our interests.
-    let poll = Poll::new()?;
-    poll.register(listener.as_fd(), Interests::read_only())?;
-    poll.register(aof.notify_fd(), Interests::read_only())?;
-    poll.register(signals.as_fd(), Interests::read_only())?;
+    let runner = Runner::new()?;
+    let reactor = runner.reactor();
+    let spawner = runner.spawner();
 
-    let mut connections: HashMap<RawFd, Connection> = HashMap::new();
-    let mut events = Events::with_capacity(EVENT_BUF_SIZE);
+    runner.spawn(
+        accept_loop(
+            listener,
+            Rc::clone(&reactor),
+            spawner.clone(),
+            Rc::clone(&database),
+            Rc::clone(&aof)
+        )
+    );
 
-    println!("Server waiting for connections...");
+    runner.spawn(signal_task(signals, Rc::clone(&reactor), spawner.clone()));
+    runner.spawn(aof_completions(Rc::clone(&aof), Rc::clone(&reactor)));
+    runner.spawn(expiry(Rc::clone(&database), Rc::clone(&reactor)));
 
-    let mut next_gen = 0;
-    let mut running = true;
-    while running {
-        let timeout_ms = database.next_expiration_timeout();
-
-        poll.wait(&mut events, timeout_ms)?;
-
-        running = handle_events(
-            &events,
-            &mut connections,
-            &mut next_gen,
-            &listener,
-            &poll,
-            &mut database,
-            &mut aof,
-            &signals
-        )?;
-
-        database.purge_expired_keys();
-    }
-
-    println!("Shutting down. Draining AOF worker...");
+    runner.run()?;
     aof.shutdown();
     Ok(())
 }

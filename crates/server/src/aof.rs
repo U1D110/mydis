@@ -1,53 +1,76 @@
 use std::{
-    fs::{File, OpenOptions},
-    io::{self, Write},
-    os::fd::{AsFd, BorrowedFd, RawFd},
-    path::Path,
-    sync::mpsc::{Receiver, Sender, channel},
-    thread::{self, JoinHandle}
+    cell::{Cell, RefCell}, 
+    collections::HashMap, 
+    fs::{File, OpenOptions}, 
+    io::{self, Write}, 
+    os::fd::{AsFd, BorrowedFd}, 
+    path::Path, 
+    pin::Pin, 
+    rc::Rc, 
+    sync::mpsc::{Receiver, Sender, channel}, 
+    task::{Context, Poll, Waker}, 
+    thread::{self, JoinHandle},
 };
 
 use db::Database;
 use net::{Notifier, Wakeup};
 use protocol::ParseResult;
 
-pub struct Aof {
-    tx: Sender<FlushRequest>,
-    worker: JoinHandle<()>,
-    wakeup: Wakeup,
-    completions: Receiver<Completion>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FlushId(u64);
+
+#[derive(Default)]
+struct PendingFlush {
+    waker: Option<Waker>,
+    result: Option<io::Result<()>>,
 }
 
-pub struct FlushRequest {
-    fd: RawFd,
+pub struct Flush {
+    id: FlushId,
+    aof: Rc<Aof>,
+}
+
+impl Future for Flush {
+    type Output = io::Result<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.aof.poll_flush(self.id, cx)
+    }
+}
+
+impl Drop for Flush {
+    fn drop(&mut self) {
+       self.aof.remove_pending_flush(self.id);
+    }
+}
+
+struct FlushRequest {
+    id: FlushId,
     bytes: Vec<u8>,
-    generation: u32,
-}
-
-impl FlushRequest {
-    pub fn new(fd: RawFd, bytes: Vec<u8>, generation: u32) -> FlushRequest {
-        FlushRequest { fd, bytes, generation }
-    }
-
-    pub fn generation(&self) -> u32 {
-        self.generation
-    }
 }
 
 pub struct Completion {
-    fd: RawFd,    // the connection whose write finished
+    id: FlushId,
     result: io::Result<()>, // did worker succeed (write_all + sync_data)?
-    generation: u32,
 }
 
 impl Completion {
-    pub fn new(fd: RawFd, result: io::Result<()>, generation: u32) -> Completion {
-        Completion { fd, result, generation }
+    pub fn new(id: FlushId, result: io::Result<()>) -> Completion {
+        Completion { id, result }
     }
 
-    pub fn into_parts(self) -> (RawFd, io::Result<()>, u32) {
-        (self.fd, self.result, self.generation)
+    fn into_parts(self) -> (FlushId, io::Result<()>) {
+        (self.id, self.result)
     }
+}
+
+pub struct Aof {
+    tx: RefCell<Option<Sender<FlushRequest>>>,
+    worker: RefCell<Option<JoinHandle<()>>>,
+    wakeup: Wakeup,
+    completions: Receiver<Completion>,
+    counter: Cell<u64>,
+    pending_flushes: RefCell<HashMap<FlushId, PendingFlush>>,
 }
 
 impl Aof {
@@ -68,47 +91,85 @@ impl Aof {
         let worker = thread::spawn(move || worker_loop(file, request_rx, completion_tx, notifier));
 
         Ok(Aof { 
-            tx: request_tx,
-            worker,
+            tx: RefCell::new(Some(request_tx)),
+            worker: RefCell::new(Some(worker)),
             wakeup,
             completions: completion_rx, 
+            counter: Cell::new(1),
+            pending_flushes: RefCell::new(HashMap::new()),
         })
     }
 
-    pub fn submit(&self, req: FlushRequest) -> io::Result<()> {
-        self.tx
-            .send(req)
-            .map_err(|_| io::Error::other("aof worker has stopped"))
+    pub fn flush(self: &Rc<Self>, bytes: Vec<u8>) -> io::Result<Flush> {
+        if let Some(sender) = self.tx.borrow().as_ref() {
+            let id = FlushId(self.counter.get());
+
+            let req = FlushRequest { id, bytes };
+
+            // Sending before inserting to avoid a stranded PendingFlush in the case of a failed
+            // send. This is safe because flush runs synchronously on the main thread and the PendingFlush
+            // will not be accessed until the returned Flush is polled.
+            sender.send(req).map_err(|_| io::Error::other("aof worker has stopped"))?;
+            self.pending_flushes.borrow_mut().insert(id, PendingFlush::default());
+
+            self.counter.update(|n| n + 1);
+            Ok(Flush { id, aof: Rc::clone(self) })
+        } else {
+            Err(io::Error::other("aof worker has stopped"))
+        }
     }
 
-    pub fn shutdown(self) {
-        let Aof { 
-            tx, 
-            worker,
-            // Using actual binding with prepended underscore both to avoid warnings
-            // and so that these are not dropped until they go out of scope with
-            // the end of the function. Using a plain underscore would result in the 
-            // values being immediately dropped, and we do not want the fd of the 
-            // Wakeup to be closed until after we have joined the worker because it 
-            // could otherwise notify epoll using reused fd.
-            wakeup: _wakeup,
-            completions: _completions,
-        } = self;
-        drop(tx);
-        let _ = worker.join();
+    pub fn remove_pending_flush(&self, id: FlushId) {
+        self.pending_flushes.borrow_mut().remove(&id);
+    }
+
+    pub fn poll_flush(&self, id: FlushId, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Some(pending) = self.pending_flushes.borrow_mut().get_mut(&id) {
+            match pending.result.take() {
+                Some(res) => Poll::Ready(res),
+                None => {
+                    let waker = cx.waker().clone();
+                    pending.waker = Some(waker);
+                    Poll::Pending
+                }
+            }
+        } else {
+            panic!("flush id does not exist");
+        }
+    }
+
+    pub fn shutdown(&self) {
+        self.tx.borrow_mut().take(); // let sender be dropped so the channel is closed
+        if let Some(handle) = self.worker.borrow_mut().take() {
+            let _ = handle.join();
+        }
     }
 
     pub fn notify_fd(&self) -> BorrowedFd<'_> {
         self.wakeup.as_fd()
     }
 
-    pub fn drain_completions(&self) -> io::Result<Vec<Completion>> {
+    pub fn drain_and_complete(&self) -> io::Result<()> {
         self.wakeup.drain()?;
-        let mut out = Vec::new();
         while let Ok(c) = self.completions.try_recv() {
-            out.push(c);
+            self.complete(c);
         }
-        Ok(out)
+        Ok(())
+    }
+
+    fn complete(&self, completion: Completion) {
+        let (id, result) = completion.into_parts();
+
+        let waker = match self.pending_flushes.borrow_mut().get_mut(&id) {
+            Some(pending) => {
+                pending.result = Some(result);
+                pending.waker.take()
+            }
+
+            None => None,
+        };
+
+        if let Some(waker) = waker { waker.wake(); }
     }
 }
 
@@ -124,13 +185,13 @@ fn worker_loop(
             .and_then(|_| file.sync_data());
 
         // Let Aof know we completed.
-        let _ = completion_sender.send(Completion::new(req.fd, result, req.generation()));
+        let _ = completion_sender.send(Completion::new(req.id, result));
         // Let event loop (epoll) know that we have Completions to process.
         let _ = notifier.notify();
     }
 }
 
-pub fn replay<P: AsRef<Path>>(path: P, database: &mut Database) -> io::Result<u64> {
+pub fn replay<P: AsRef<Path>>(path: P, database: Rc<RefCell<Database>>) -> io::Result<u64> {
     // Read file into memory. Fine for the scale of this project.
     let bytes = match std::fs::read(path) {
         Ok(f) => f,
@@ -142,7 +203,7 @@ pub fn replay<P: AsRef<Path>>(path: P, database: &mut Database) -> io::Result<u6
     while offset < bytes.len() {
         match protocol::parse(&bytes[offset..]) {
             ParseResult::Complete(command, consumed) => {
-                let _ = database.execute(command);
+                let _ = database.borrow_mut().execute(command);
                 offset += consumed;
             }
             ParseResult::Incomplete => break, // truncated tail - crashed mid write

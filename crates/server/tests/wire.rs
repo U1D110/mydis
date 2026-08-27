@@ -164,6 +164,9 @@ fn aof_replay_across_restart() {
 #[test]
 fn graceful_shutdown() {
     let mut server = ServerProcess::start();
+    let mut connection = server.connect();
+    connection.write_all(b"*3\r\n$3\r\nSET\r\n$4\r\nname\r\n$5\r\nSpeed\r\n").unwrap();
+    expect(&mut connection, b"+OK\r\n");
     server.terminate();
 
     let status = server
