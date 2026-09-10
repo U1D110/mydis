@@ -1,155 +1,192 @@
+use crate::aof::Aof;
+
+use db::Database;
+use protocol::{ErrorKind, ParseResult, Response};
 use net::TcpStream;
-use runtime::Poll;
-use std::{io, os::fd::{AsFd, BorrowedFd}};
+use runtime::Reactor;
+use std::{cell::RefCell, io, os::fd::{AsFd, BorrowedFd}, rc::Rc};
 
 const READ_BUF_SIZE: usize = 4096;
 const WRITE_BUF_SIZE: usize = 4096;
 const MAX_READ_BUF: usize = 64*1024*1024;
+const PERSIST_BATCH_LIMIT: usize = 1024 * 1024;
 
-enum FlushState {
-    Pending { response: Vec<u8> },
-    Ready { result: io::Result<()>, response: Vec<u8> },
+pub async fn handle_connection(
+    stream: TcpStream,
+    reactor: Rc<Reactor>,
+    database: Rc<RefCell<Database>>,
+    aof: Rc<Aof>
+) {
+    let mut connection = Connection {
+        stream,
+        read_buf: Vec::with_capacity(READ_BUF_SIZE),
+        write_buf: Vec::with_capacity(WRITE_BUF_SIZE),
+    };
+
+    let registered = reactor.register(connection.as_fd()).expect("failed to register connection");
+
+    let mut processing_state = ProcessingState::Idle;
+
+    loop {
+        // if there aren't commands left to process from the previous iteration
+        if processing_state != ProcessingState::InProgress {
+            registered.readable().await;
+        }
+
+        let connection_closed = loop {
+            match connection.read() {
+                Ok(ConnectionStatus::Closed) => break true,
+                Ok(_) => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break false,
+                Err(_) => return,
+            }
+        };
+
+        processing_state = match process_commands(&mut connection, &database, &aof).await {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+
+        if processing_state == ProcessingState::Close { return; }
+
+        while !connection.write_buf.is_empty() {
+            match connection.pump() {
+                Ok(()) => break,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => registered.writable().await,
+                Err(_) => return,
+            }
+        }
+
+        if connection_closed && processing_state != ProcessingState::InProgress {
+            return;
+        }
+    }
 }
 
-impl FlushState {
-    pub fn poll(&mut self) -> Poll<io::Result<()>> {
-        match self {
-            FlushState::Pending { .. } => Poll::Pending,
-            FlushState::Ready { result, .. } => {
-                Poll::Ready(std::mem::replace(result, Ok(())))
+
+#[derive(PartialEq)]
+enum ProcessingState {
+    Idle,
+    InProgress,
+    Close,
+}
+
+async fn process_commands(
+    connection: &mut Connection,
+    database: &Rc<RefCell<Database>>,
+    aof: &Rc<Aof>,
+) -> io::Result<ProcessingState> {
+    let mut aof_buf: Vec<u8> = Vec::new();
+    let mut response_buf: Vec<u8> = Vec::new();
+    let mut state = ProcessingState::Idle;
+
+    loop {
+        match protocol::parse(&connection.read_buf) {
+            ParseResult::Complete(command, to_consume) => {
+                connection.read_buf.drain(..to_consume);
+
+                let result = database.borrow_mut().execute(command);
+                let mut response_bytes = protocol::serialize(result.response);
+
+                if let Some(command_to_persist) = result.persist {
+                    aof_buf.append(&mut command_to_persist.to_resp_bytes());
+                }
+
+                if aof_buf.is_empty() {
+                    connection.queue_bytes(&response_bytes)
+                } else {
+                    response_buf.append(&mut response_bytes);
+                }
+
+                if aof_buf.len() >= PERSIST_BATCH_LIMIT {
+                    state = ProcessingState::InProgress;
+                    break;
+                }
+            }
+            ParseResult::Incomplete => break,
+            ParseResult::Error(err) => {
+                // The stream is corrupt, so this connection is closing. Commands already
+                // parsed in this batch have run and mutated the database, so their AOF
+                // bytes must still be persisted -- dropping them would leave the log
+                // disagreeing with the keyspace across a restart.
+                //
+                // We deliberately do not `begin_flush` here, because there is nothing to
+                // resume into. That means `response_buf` is dropped: a client that sent
+                // `SET a`, `SET b`, <garbage> receives only the error and never the two
+                // `+OK`s, even though both writes are durable. Acceptable -- a client that
+                // corrupted its own framing cannot trust the reply stream anyway, and it
+                // matches Redis, which answers a protocol error with an error and a close.
+                //
+                // The completion for this flush arrives after the connection has been
+                // removed, and is discarded because `Flush::drop` removes the entry and 
+                // `Aof::complete` finds nothing to wake.
+                if !aof_buf.is_empty() {
+                    let _ = aof.flush(aof_buf);
+                }
+                let bytes = protocol::serialize(Response::Error(ErrorKind::from(err)));
+                connection.queue_bytes(&bytes);
+                return Ok(ProcessingState::Close);
             }
         }
     }
 
-    pub fn complete(&mut self, result: io::Result<()>) {
-        if let FlushState::Pending { response } = self {
-            let response = std::mem::take(response);
-            *self = FlushState::Ready { result, response };
-        }
+    if !aof_buf.is_empty() {
+        aof.flush(aof_buf)?.await?;
+        connection.queue_bytes(&response_buf);
     }
+
+    Ok(state)
 }
 
 #[derive(PartialEq)]
-pub enum ConnectionStatus {
+enum ConnectionStatus {
     Active,
     Closed,
 }
 
-pub struct Connection {
+struct Connection {
     stream: TcpStream,
     read_buf: Vec<u8>, // Maybe we use BytesMut from `bytes` crate later on
     write_buf: Vec<u8>,
-    flush: Option<FlushState>,
-    generation: u32,
 }
 
 impl Connection {
-    pub fn new(stream: TcpStream, generation: u32) -> Self {
-        Connection {
-            stream,
-            read_buf: Vec::with_capacity(READ_BUF_SIZE),
-            write_buf: Vec::with_capacity(WRITE_BUF_SIZE),
-            flush: None,
-            generation,
-        }
-    }
-
-    pub fn generation(&self) -> u32 {
-        self.generation
-    }
-
-    pub fn is_blocked(&self) -> bool {
-        self.flush.is_some()
-    }
-
-    pub fn has_pending_writes(&self) -> bool {
-        !self.write_buf.is_empty()
-    }
-
-    pub fn read_buf(&self) -> &[u8] {
-        &self.read_buf
-    }
-
-    pub fn poll_flush(&mut self) -> Poll<io::Result<()>> {
-        match self.flush.as_mut() {
-            Some(state) => match state.poll() {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(result) => {
-                    if let Some(FlushState::Ready { response, ..}) = self.flush.take() {
-                        if result.is_ok() {
-                            // resume: send the reply we've been holding on to.
-                            self.queue_bytes(&response); 
-                        }
-                        // Err: response dropped after we exit current scope because we just took ownership
-                        //      of the FlushState in flush. (never ack a lost write)
-                    }
-                    Poll::Ready(result)
-                }
-            },
-            None => Poll::Ready(Ok(())),
-        }
-    }
-
-    pub fn begin_flush(&mut self, response: Vec<u8>) {
-        self.flush = Some(FlushState::Pending { response });
-    }
-
-    pub fn complete_flush(&mut self, result: io::Result<()>) {
-        if let Some(state) = self.flush.as_mut() {
-            state.complete(result);
-        }
-    }
-
-    pub fn drain_read_bytes(&mut self, num_bytes: usize) {
-        self.read_buf.drain(..num_bytes);
-    }
-
-    pub fn read(&mut self) -> io::Result<ConnectionStatus> {
+    fn read(&mut self) -> io::Result<ConnectionStatus> {
         let mut buf = [0u8; READ_BUF_SIZE];
-        match self.stream.read(&mut buf) {
-            Ok(bytes_read) => {
-                if bytes_read == 0 {
-                    // client disconnected
-                    Ok(ConnectionStatus::Closed)
-                } else {
-                    self.read_buf.extend_from_slice(&buf[..bytes_read]);
+        let bytes_read = self.stream.read(&mut buf)?;
 
-                    if self.read_buf().len() >= MAX_READ_BUF {
-                        Err(io::Error::other("exceeded query buffer limit"))
-                    } else {
-                        Ok(ConnectionStatus::Active)
-                    }
-                }
-            }
-            Err(err) => Err(err),
+        // client disconnected
+        if bytes_read == 0 { 
+            return Ok(ConnectionStatus::Closed); 
         }
+        
+        self.read_buf.extend_from_slice(&buf[..bytes_read]);
+
+        if self.read_buf.len() >= MAX_READ_BUF {
+            return Err(io::Error::other("exceeded query buffer limit"));
+        }
+
+        Ok(ConnectionStatus::Active)
     }
 
-    pub fn queue_bytes(&mut self, bytes: &[u8]) {
+    fn queue_bytes(&mut self, bytes: &[u8]) {
         self.write_buf.extend_from_slice(bytes);
     }
 
-    fn write(&self) -> io::Result<usize> {
-        self.stream.write(&self.write_buf)
-    }
-
-    pub fn pump(&mut self) -> io::Result<()> {
+    fn pump(&mut self) -> io::Result<()> {
         if self.write_buf.is_empty() {
             return Ok(());
         }
 
-        match self.write() {
-            Ok(bytes_sent) => {
-                self.write_buf.drain(..bytes_sent);
-                if self.write_buf.is_empty() {
-                    Ok(())
-                } else {
-                    // Partial write - treat like WouldBlock
-                    Err(io::Error::from(io::ErrorKind::WouldBlock))
-                }
-            }
-            Err(err) => Err(err),
+        let bytes_sent = self.stream.write(&self.write_buf)?;
+
+        self.write_buf.drain(..bytes_sent);
+
+        if !self.write_buf.is_empty() {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
         }
+
+        Ok(())
     }
 }
 
